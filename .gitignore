@@ -1,0 +1,6 @@
+# Your real config holds an SSH key, Tailscale auth key and Cloudflare token —
+# never commit it. Only the example template is tracked.
+config.env
+
+# Local logs
+*.log
