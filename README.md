@@ -49,14 +49,15 @@ runs, edit the *Fixed policy* constants near the top of `harden-vps.sh`.
 
 - The firewall is only restricted to Tailscale **after** Tailscale is confirmed
   connected. If it isn't, **public SSH is left open** (still key-only +
-  fail2ban) and the script tells you to re-run once Tailscale works.
+  fail2ban) and the script tells you how to close port 22 once Tailscale works.
 - SSH config is written as a **drop-in** and validated with `sshd -t` before
   reload; if it's invalid the drop-in is removed so your current session stays up.
 - Tailscale SSH is always enabled, so even a blank SSH key still leaves you a
   way in over the tailnet (the script warns you when no key is installed).
 - **Always verify access in a second terminal before closing your root session.**
   The script reminds you at the end.
-- The script is **idempotent** — safe to re-run after fixing something.
+- It's meant to run **once on a freshly provisioned box** (it assumes the user
+  and config don't already exist).
 
 ## After it finishes
 

@@ -25,7 +25,7 @@
 #
 # Safety: the firewall is only locked to Tailscale AFTER Tailscale is confirmed
 # connected. If Tailscale isn't up, public SSH is kept open so you can't get
-# locked out. The script is idempotent — safe to re-run.
+# locked out. It's meant to run once, on a freshly provisioned box.
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -104,20 +104,17 @@ section "System update & base packages"
 # ═════════════════════════════════════════════════════════════════════════════
 apt-get update -qq
 apt-get upgrade -y -qq
-apt-get install -y -qq \
-  curl wget git vim nano ufw fail2ban tmux ca-certificates gnupg \
-  unattended-upgrades htop rsync >/dev/null
+# Bare minimum: only the services the script configures. curl + CA certs are
+# assumed already present (they are on stock images); Tailscale and cloudflared
+# pull their own dependencies.
+apt-get install -y -qq ufw fail2ban tmux unattended-upgrades >/dev/null
 ok "Base packages installed"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Non-root sudo user: ${USERNAME}"
 # ═════════════════════════════════════════════════════════════════════════════
-if id "${USERNAME}" >/dev/null 2>&1; then
-  ok "User '${USERNAME}' already exists"
-else
-  adduser --disabled-password --gecos "" "${USERNAME}"
-  ok "Created user '${USERNAME}'"
-fi
+adduser --disabled-password --gecos "" "${USERNAME}"
+ok "Created user '${USERNAME}'"
 usermod -aG sudo "${USERNAME}"
 ok "Added '${USERNAME}' to sudo group"
 
@@ -144,8 +141,7 @@ if [[ -n "${SSH_PUBLIC_KEY}" ]]; then
   user_home="/home/${USERNAME}"
   install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "${user_home}/.ssh"
   auth="${user_home}/.ssh/authorized_keys"
-  touch "${auth}"
-  grep -qxF "${SSH_PUBLIC_KEY}" "${auth}" || echo "${SSH_PUBLIC_KEY}" >> "${auth}"
+  echo "${SSH_PUBLIC_KEY}" > "${auth}"
   chmod 600 "${auth}"; chown "${USERNAME}:${USERNAME}" "${auth}"
   ok "Installed SSH key for ${USERNAME}"
 else
@@ -155,12 +151,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 section "Tailscale"
 # ═════════════════════════════════════════════════════════════════════════════
-if ! command -v tailscale >/dev/null 2>&1; then
-  curl -fsSL https://tailscale.com/install.sh | sh
-  ok "Tailscale installed"
-else
-  ok "Tailscale already installed"
-fi
+curl -fsSL https://tailscale.com/install.sh | sh
+ok "Tailscale installed"
 systemctl enable --now tailscaled >/dev/null 2>&1 || true
 
 # Bring Tailscale up. If an auth key is rejected, say so and re-ask (or fall back
@@ -276,7 +268,7 @@ else
   # Safety net: Tailscale unconfirmed, so keep public SSH open (key-only + fail2ban).
   ufw allow "${SSH_PORT}/tcp" comment 'SSH (public — Tailscale not confirmed)' >/dev/null
   warn "Tailscale wasn't confirmed — left public SSH OPEN so you aren't locked out."
-  warn "Once Tailscale works, re-run this script to close port ${SSH_PORT}."
+  warn "Once Tailscale works: run 'tailscale up --ssh', then 'ufw delete allow ${SSH_PORT}/tcp'."
   SSH_EXPOSURE="Public (key-only + fail2ban)"
 fi
 
@@ -286,18 +278,14 @@ ok "UFW enabled — default-deny inbound"
 # ═════════════════════════════════════════════════════════════════════════════
 section "cloudflared (Cloudflare Tunnel)"
 # ═════════════════════════════════════════════════════════════════════════════
-if ! command -v cloudflared >/dev/null 2>&1; then
-  install -d -m 755 /usr/share/keyrings
-  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-    | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-  echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
-    > /etc/apt/sources.list.d/cloudflared.list
-  apt-get update -qq
-  apt-get install -y -qq cloudflared >/dev/null
-  ok "cloudflared installed ($(cloudflared --version 2>/dev/null | head -n1))"
-else
-  ok "cloudflared already installed"
-fi
+install -d -m 755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+  | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+  > /etc/apt/sources.list.d/cloudflared.list
+apt-get update -qq
+apt-get install -y -qq cloudflared >/dev/null
+ok "cloudflared installed ($(cloudflared --version 2>/dev/null | head -n1))"
 
 # A connector token is required — the tunnel is how services are exposed, with
 # no open inbound ports. Re-asks until a token actually registers the service.
@@ -320,8 +308,7 @@ section "tmux (persistent sessions)"
 # ═════════════════════════════════════════════════════════════════════════════
 user_home="/home/${USERNAME}"
 tmux_conf="${user_home}/.tmux.conf"
-if [[ ! -f "${tmux_conf}" ]]; then
-  cat > "${tmux_conf}" <<'EOF'
+cat > "${tmux_conf}" <<'EOF'
 # ── tmux: keep long-running work alive across SSH drops ──────────────────────
 set -g default-terminal "tmux-256color"
 set -g history-limit 50000
@@ -340,28 +327,20 @@ set -g status-right-length 40
 # New named session:  tmux new -s work
 # Detach:             Ctrl-b then d
 EOF
-  chown "${USERNAME}:${USERNAME}" "${tmux_conf}"
-  ok "Wrote ${tmux_conf}"
-else
-  ok "${tmux_conf} already exists — left untouched"
-fi
+chown "${USERNAME}:${USERNAME}" "${tmux_conf}"
+ok "Wrote ${tmux_conf}"
 
 # Auto-create a 'main' tmux session at login so work survives disconnects.
 profile_d="${user_home}/.bash_profile"
-hook='# Auto-attach to a persistent tmux session on interactive SSH login'
-if ! grep -qF "${hook}" "${profile_d}" 2>/dev/null; then
-  cat >> "${profile_d}" <<'EOF'
+cat >> "${profile_d}" <<'EOF'
 
 # Auto-attach to a persistent tmux session on interactive SSH login
 if command -v tmux >/dev/null 2>&1 && [ -n "$PS1" ] && [ -z "$TMUX" ] && [ -n "$SSH_CONNECTION" ]; then
   tmux attach -t main 2>/dev/null || tmux new -s main
 fi
 EOF
-  chown "${USERNAME}:${USERNAME}" "${profile_d}"
-  ok "Login auto-attaches to tmux session 'main'"
-else
-  ok "tmux login hook already present"
-fi
+chown "${USERNAME}:${USERNAME}" "${profile_d}"
+ok "Login auto-attaches to tmux session 'main'"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Unattended security upgrades"
@@ -403,6 +382,6 @@ echo "  3. Only once that works, you may close this root session."
 if ! is_true "${TS_CONNECTED}"; then
   echo
   echo "  ⚠ Public SSH is still OPEN because Tailscale wasn't confirmed."
-  echo "    Fix Tailscale, then re-run ./harden-vps.sh to close port ${SSH_PORT}."
+  echo "    Fix Tailscale (tailscale up --ssh), then: ufw delete allow ${SSH_PORT}/tcp"
 fi
 echo
