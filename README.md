@@ -33,8 +33,9 @@ the same hardened box. The script **asks for what it needs, when it needs it**,
 and re-asks if you give it something it can't use:
 
 - **Username** for the non-root sudo account (re-asks if invalid).
-- **Your SSH public key** — `cat ~/.ssh/id_ed25519.pub` on your laptop
-  (re-asks on bad format; blank is allowed since Tailscale SSH still gets you in).
+- **Your SSH public key** — `cat ~/.ssh/id_ed25519.pub` on your laptop.
+  **Required** (re-asks on bad format). Tailscale restricts *where* SSH is
+  reachable from; this key proves *who* you are.
 - **Tailscale auth key** from
   https://login.tailscale.com/admin/settings/keys — **re-asks if the key is
   rejected**. Leave it blank to log in via the browser URL it prints instead.
@@ -52,8 +53,9 @@ runs, edit the *Fixed policy* constants near the top of `harden-vps.sh`.
   fail2ban) and the script tells you how to close port 22 once Tailscale works.
 - SSH config is written as a **drop-in** and validated with `sshd -t` before
   reload; if it's invalid the drop-in is removed so your current session stays up.
-- Tailscale SSH is always enabled, so even a blank SSH key still leaves you a
-  way in over the tailnet (the script warns you when no key is installed).
+- Your SSH key is installed **before** SSH is hardened, so you always have a
+  working login; SSH is then restricted to the Tailscale interface only after
+  Tailscale is confirmed connected.
 - **Always verify access in a second terminal before closing your root session.**
   The script reminds you at the end.
 - It's meant to run **once on a freshly provisioned box** (it assumes the user

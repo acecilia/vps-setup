@@ -98,6 +98,11 @@ ask_retry() {
 
 # Username is referenced everywhere (section titles, AllowUsers…) so resolve it
 # first. Re-asks until it's a valid Linux username.
+echo
+warn "── Non-root USERNAME ────────────────────────────────────────────────"
+warn "What:  the login name for the everyday sudo account this script creates."
+warn "Why:   you'll log in as this user; direct root SSH login is disabled."
+warn "Pick:  anything you like — lowercase letters, digits, '-' and '_'."
 while ! [[ "${USERNAME}" =~ ^[a-z_][a-z0-9_-]*$ ]]; do
   [[ -n "${USERNAME}" ]] && warn "Invalid username '${USERNAME}' — use lowercase letters, digits, '-' and '_'."
   ask USERNAME "Username for the non-root sudo account"
@@ -133,28 +138,28 @@ chmod 440 "/etc/sudoers.d/90-${USERNAME}"
 visudo -cf "/etc/sudoers.d/90-${USERNAME}" >/dev/null || die "Generated sudoers file is invalid"
 ok "Passwordless sudo enabled"
 
-# Ask for the SSH public key, re-asking on bad format. Blank is allowed because
-# Tailscale SSH still gives you a way in.
-warn "Paste your *public* key (ssh-ed25519 AAAA... you@host)."
-warn "Leave blank to rely on Tailscale SSH instead."
+# Ask for the SSH public key (required). Re-asks until it looks like a public key.
+echo
+warn "── Your SSH PUBLIC key (required) ───────────────────────────────────"
+warn "What:  the *public* half of your SSH keypair — the one-line .pub file."
+warn "Why:   it's installed for '${USERNAME}' so you can authenticate over SSH."
+warn "       Tailscale restricts WHERE ssh is reachable from; this key proves WHO"
+warn "       you are. (The matching private key never leaves your laptop.)"
+warn "Where: on your laptop run  cat ~/.ssh/id_ed25519.pub  and copy the line."
+warn "       No keypair yet?  ssh-keygen -t ed25519  first, then copy the .pub."
 while :; do
-  ask SSH_PUBLIC_KEY "SSH public key"
-  [[ -z "${SSH_PUBLIC_KEY}" ]] && break
+  ask SSH_PUBLIC_KEY "Paste your SSH public key (ssh-ed25519 / ssh-rsa / ecdsa-...)"
   [[ "${SSH_PUBLIC_KEY}" =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]] && break
-  warn "That doesn't look like a public key — it should start with ssh-ed25519 / ssh-rsa / ecdsa-."
+  warn "That doesn't look like a public key — it should start with ssh-ed25519 / ssh-rsa / ecdsa-. Try again."
 done
 
 # Install the key for the user (root keeps its existing keys, so this session stays up).
-if [[ -n "${SSH_PUBLIC_KEY}" ]]; then
-  user_home="/home/${USERNAME}"
-  install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "${user_home}/.ssh"
-  auth="${user_home}/.ssh/authorized_keys"
-  echo "${SSH_PUBLIC_KEY}" > "${auth}"
-  chmod 600 "${auth}"; chown "${USERNAME}:${USERNAME}" "${auth}"
-  ok "Installed SSH key for ${USERNAME}"
-else
-  warn "No SSH key installed — you will depend on Tailscale SSH for access."
-fi
+user_home="/home/${USERNAME}"
+install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "${user_home}/.ssh"
+auth="${user_home}/.ssh/authorized_keys"
+echo "${SSH_PUBLIC_KEY}" > "${auth}"
+chmod 600 "${auth}"; chown "${USERNAME}:${USERNAME}" "${auth}"
+ok "Installed SSH key for ${USERNAME}"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Tailscale"
@@ -165,10 +170,18 @@ systemctl enable --now tailscaled >/dev/null 2>&1 || true
 
 # Bring Tailscale up. If an auth key is rejected, say so and re-ask (or fall back
 # to browser login). Loops until the box is actually on the tailnet.
+echo
+warn "── TAILSCALE auth key ───────────────────────────────────────────────"
+warn "What:  a one-off key that joins THIS server to your private tailnet."
+warn "Why:   Tailscale becomes the only network path to SSH — port 22 is later"
+warn "       firewalled to the tailscale0 interface, so the box is never exposed"
+warn "       to the public internet."
+warn "Where: https://login.tailscale.com/admin/settings/keys → 'Generate auth key'"
+warn "       (reusable or ephemeral is fine). Blank = log in via a browser URL"
+warn "       this script prints instead."
 while :; do
   if [[ -z "${TAILSCALE_AUTHKEY}" ]]; then
-    warn "Get a key at https://login.tailscale.com/admin/settings/keys"
-    ask TAILSCALE_AUTHKEY "Tailscale auth key (blank to log in via browser URL)" silent
+    ask TAILSCALE_AUTHKEY "Tailscale auth key (blank for browser login)" silent
   fi
 
   if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
@@ -297,7 +310,14 @@ ok "cloudflared installed ($(cloudflared --version 2>/dev/null | head -n1))"
 
 # A connector token is required — the tunnel is how services are exposed, with
 # no open inbound ports. Re-asks until a token actually registers the service.
-warn "Get a connector token from Zero Trust → Networks → Tunnels → Install connector."
+echo
+warn "── CLOUDFLARE Tunnel token (required) ───────────────────────────────"
+warn "What:  a connector token that links this box to a Cloudflare Tunnel."
+warn "Why:   it lets you publish services through Cloudflare with NO open inbound"
+warn "       ports — the firewall stays default-deny."
+warn "Where: Cloudflare Zero Trust → Networks → Tunnels → create/pick a tunnel →"
+warn "       'Install connector' → copy the token out of the shown"
+warn "       'cloudflared service install <TOKEN>' command."
 while :; do
   [[ -z "${CLOUDFLARED_TUNNEL_TOKEN}" ]] && ask CLOUDFLARED_TUNNEL_TOKEN "Cloudflare Tunnel token" silent
   # `service install` decodes the token locally and registers the service.
