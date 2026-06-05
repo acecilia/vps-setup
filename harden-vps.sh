@@ -27,6 +27,9 @@
 # connected. If Tailscale isn't up, public SSH is kept open so you can't get
 # locked out. It's meant to run once, on a freshly provisioned box.
 # ─────────────────────────────────────────────────────────────────────────────
+# Fail fast: stop on any error (-e), any unset variable (-u), or any failed
+# command in a pipe (pipefail). -E makes the ERR trap below also fire inside
+# functions, so nothing fails silently.
 set -Eeuo pipefail
 
 LOG_FILE="/var/log/harden-vps.log"
@@ -39,6 +42,8 @@ die()  { echo "✗ $*" >&2; exit 1; }
 step=0
 section() { step=$((step+1)); echo; log "[${step}] $*"; }
 
+# If any command fails unexpectedly, print which line and command broke, then
+# exit — instead of charging ahead in a half-configured state.
 trap 'die "Failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
 # ── Preflight ────────────────────────────────────────────────────────────────
@@ -46,7 +51,8 @@ trap 'die "Failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 command -v apt-get >/dev/null 2>&1 || die "This script targets Debian/Ubuntu (apt). Detected something else."
 [[ -t 0 ]] || die "Run this interactively — it asks for a few values (username, SSH key, Tailscale key)."
 
-# Mirror all output to a logfile for later inspection.
+# Send all output (stdout + stderr) to the terminal AND append it to a logfile
+# via `tee`, so there's a full record of the run to look at afterwards.
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "╭──────────────────────────────────────────────╮"
@@ -97,6 +103,8 @@ while ! [[ "${USERNAME}" =~ ^[a-z_][a-z0-9_-]*$ ]]; do
   ask USERNAME "Username for the non-root sudo account"
 done
 
+# Stop apt from opening interactive dialogs (e.g. "keep or replace this config
+# file?") during the upgrade — it picks the safe default instead of hanging.
 export DEBIAN_FRONTEND=noninteractive
 
 # ═════════════════════════════════════════════════════════════════════════════
