@@ -6,8 +6,12 @@
 #
 #     scp -r vps-setup root@<server-ip>:/root/        # from your laptop
 #     ssh root@<server-ip>
-#     cd vps-setup && cp config.env.example config.env && nano config.env
-#     ./harden-vps.sh
+#     cd vps-setup && ./harden-vps.sh
+#
+# It asks for what it needs (username, your SSH public key, Tailscale auth key,
+# optional Cloudflare token). Everything else uses sane, secure defaults. For
+# an unattended run, export the same names as environment variables instead,
+# e.g.  USERNAME=andres SSH_PUBLIC_KEY="ssh-ed25519 ..." ./harden-vps.sh
 #
 # What it does, in order:
 #   1.  System update + base packages
@@ -26,9 +30,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
-# ── Paths & logging ──────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/config.env"
+# ── Logging ──────────────────────────────────────────────────────────────────
 LOG_FILE="/var/log/harden-vps.log"
 
 # Colours (disabled if not a tty)
@@ -62,25 +64,20 @@ echo "${C_BOLD}│  Hetzner VPS hardening & setup                │${C_RESET}"
 echo "${C_BOLD}╰──────────────────────────────────────────────╯${C_RESET}"
 echo "   log: ${LOG_FILE}"
 
-# ── Load config ──────────────────────────────────────────────────────────────
-if [[ -f "${CONFIG_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${CONFIG_FILE}"
-  ok "Loaded ${CONFIG_FILE}"
-else
-  warn "No config.env found — falling back to prompts/defaults."
-  warn "Tip: cp config.env.example config.env && edit it for repeatable runs."
-fi
-
-# Defaults for anything not set by config.env
+# ── Settings ─────────────────────────────────────────────────────────────────
+# Secrets/identity are asked for interactively, at the moment they're needed,
+# and re-asked if rejected. Anything below can still be pre-set as an environment
+# variable for an unattended run (e.g. USERNAME=andres ./harden-vps.sh).
 USERNAME="${USERNAME:-}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
-PASSWORDLESS_SUDO="${PASSWORDLESS_SUDO:-true}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
+CLOUDFLARED_TUNNEL_TOKEN="${CLOUDFLARED_TUNNEL_TOKEN:-}"
+
+# Non-secret behaviour toggles (secure defaults; override via env if you must).
+PASSWORDLESS_SUDO="${PASSWORDLESS_SUDO:-true}"
 TAILSCALE_SSH="${TAILSCALE_SSH:-true}"
 SSH_TAILSCALE_ONLY="${SSH_TAILSCALE_ONLY:-true}"
 INSTALL_CLOUDFLARED="${INSTALL_CLOUDFLARED:-true}"
-CLOUDFLARED_TUNNEL_TOKEN="${CLOUDFLARED_TUNNEL_TOKEN:-}"
 SSH_PORT="${SSH_PORT:-22}"
 PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-no}"
 PASSWORD_AUTH="${PASSWORD_AUTH:-no}"
@@ -90,30 +87,33 @@ F2B_MAXRETRY="${F2B_MAXRETRY:-3}"
 ENABLE_UNATTENDED_UPGRADES="${ENABLE_UNATTENDED_UPGRADES:-true}"
 SET_TIMEZONE="${SET_TIMEZONE:-}"
 
-is_true() { [[ "${1,,}" =~ ^(true|yes|1|y)$ ]]; }
+is_true()  { [[ "${1,,}" =~ ^(true|yes|1|y)$ ]]; }
+have_tty() { [[ -t 0 ]]; }
 
-prompt_if_empty() {  # var_name  "Prompt text"  [silent]
+# ask VAR "prompt text" [silent] — read a fresh value into VAR (overwrites it).
+# Dies if there's no terminal, naming the env var to set for unattended runs.
+ask() {
   local var="$1" text="$2" silent="${3:-}" val
-  [[ -n "${!var}" ]] && return 0
-  if [[ ! -t 0 ]]; then die "${var} is unset and there's no terminal to prompt on. Set it in config.env."; fi
+  have_tty || die "Need ${var} but there's no terminal to ask on. Re-run with ${var}=... set."
   if [[ "${silent}" == "silent" ]]; then read -rsp "   ${text}: " val; echo; else read -rp "   ${text}: " val; fi
   printf -v "${var}" '%s' "${val}"
 }
 
-# Collect the essentials up front so the run is unattended afterwards.
-prompt_if_empty USERNAME "Username for the non-root sudo account"
-[[ "${USERNAME}" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid username: '${USERNAME}'"
-if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
-  warn "No SSH_PUBLIC_KEY set. Paste your *public* key now (ssh-ed25519 AAAA... you@host),"
-  warn "or leave blank ONLY if you'll rely solely on Tailscale SSH."
-  prompt_if_empty SSH_PUBLIC_KEY "SSH public key (blank to skip)"
-fi
-if [[ -n "${SSH_PUBLIC_KEY}" && ! "${SSH_PUBLIC_KEY}" =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]]; then
-  die "That doesn't look like an SSH public key. Expected it to start with ssh-ed25519 / ssh-rsa / ecdsa-."
-fi
-if [[ -z "${SSH_PUBLIC_KEY}" && -z "${TAILSCALE_AUTHKEY}" ]] && ! is_true "${TAILSCALE_SSH}"; then
-  die "Refusing to continue: no SSH key, no Tailscale auth key, and Tailscale SSH disabled — you'd be locked out."
-fi
+# ask_retry "question" — yes/no prompt, defaults to No. False if no terminal.
+ask_retry() {
+  local ans
+  have_tty || return 1
+  read -rp "   $1 [y/N] " ans
+  [[ "${ans,,}" =~ ^(y|yes)$ ]]
+}
+
+# Username is referenced everywhere (section titles, AllowUsers…) so resolve it
+# first. Re-asks until it's a valid Linux username.
+while ! [[ "${USERNAME}" =~ ^[a-z_][a-z0-9_-]*$ ]]; do
+  [[ -n "${USERNAME}" ]] && warn "Invalid username '${USERNAME}' — use lowercase letters, digits, '-' and '_'."
+  USERNAME=""
+  ask USERNAME "Username for the non-root sudo account"
+done
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -150,7 +150,30 @@ if is_true "${PASSWORDLESS_SUDO}"; then
   ok "Passwordless sudo enabled"
 fi
 
-# Install the SSH key for the user (and root, so existing access keeps working)
+# Ask for the SSH public key now (only if not pre-set), re-asking on bad format.
+# Blank is allowed only when Tailscale SSH will still give you a way in.
+if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
+  if have_tty; then
+    warn "Paste your *public* key (ssh-ed25519 AAAA... you@host)."
+    is_true "${TAILSCALE_SSH}" && warn "Leave blank to rely on Tailscale SSH instead."
+    while :; do
+      ask SSH_PUBLIC_KEY "SSH public key"
+      [[ -z "${SSH_PUBLIC_KEY}" ]] && break
+      [[ "${SSH_PUBLIC_KEY}" =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]] && break
+      warn "That doesn't look like a public key — it should start with ssh-ed25519 / ssh-rsa / ecdsa-."
+      SSH_PUBLIC_KEY=""
+    done
+  fi
+elif [[ ! "${SSH_PUBLIC_KEY}" =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]]; then
+  die "SSH_PUBLIC_KEY doesn't look like a public key (expected ssh-ed25519 / ssh-rsa / ecdsa-...)."
+fi
+
+# Never leave a box with no way back in.
+if [[ -z "${SSH_PUBLIC_KEY}" ]] && ! is_true "${TAILSCALE_SSH}"; then
+  die "No SSH key and Tailscale SSH disabled — that would lock you out. Provide a key or enable TAILSCALE_SSH."
+fi
+
+# Install the key for the user (root keeps its existing keys, so this session stays up).
 if [[ -n "${SSH_PUBLIC_KEY}" ]]; then
   user_home="/home/${USERNAME}"
   install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "${user_home}/.ssh"
@@ -177,13 +200,32 @@ systemctl enable --now tailscaled >/dev/null 2>&1 || true
 ts_up_args=()
 is_true "${TAILSCALE_SSH}" && ts_up_args+=(--ssh)
 
-if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
-  tailscale up --authkey="${TAILSCALE_AUTHKEY}" "${ts_up_args[@]}"
-else
-  warn "No TAILSCALE_AUTHKEY set. Running interactive \`tailscale up\`."
-  warn "Open the URL it prints, approve the machine, then this continues."
-  tailscale up "${ts_up_args[@]}"
-fi
+# Bring Tailscale up. If an auth key is rejected, say so and re-ask (or fall
+# back to browser login). Loops until the box is actually on the tailnet.
+while :; do
+  if [[ -z "${TAILSCALE_AUTHKEY}" ]] && have_tty; then
+    warn "Get a key at https://login.tailscale.com/admin/settings/keys"
+    ask TAILSCALE_AUTHKEY "Tailscale auth key (blank to log in via browser URL)"
+  fi
+
+  if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
+    if tailscale up --authkey="${TAILSCALE_AUTHKEY}" "${ts_up_args[@]}"; then
+      break
+    fi
+    warn "Tailscale rejected that auth key (expired, wrong, or already used?)."
+    TAILSCALE_AUTHKEY=""
+    have_tty || die "Invalid TAILSCALE_AUTHKEY and no terminal to re-ask. Re-run with a valid key."
+    # loop re-asks for a fresh key
+  else
+    warn "Starting interactive Tailscale login — open the URL it prints and approve this machine."
+    if tailscale up "${ts_up_args[@]}"; then
+      break
+    fi
+    warn "Interactive Tailscale login didn't complete."
+    have_tty || die "Couldn't bring Tailscale up unattended. Re-run with TAILSCALE_AUTHKEY=... set."
+    ask_retry "Try Tailscale login again?" || break
+  fi
+done
 
 # Verify Tailscale is actually connected before we trust it for the firewall.
 TS_CONNECTED="false"
@@ -205,7 +247,7 @@ section "SSH daemon hardening"
 sshd_drop="/etc/ssh/sshd_config.d/99-hardening.conf"
 install -d -m 755 /etc/ssh/sshd_config.d
 cat > "${sshd_drop}" <<EOF
-# Managed by harden-vps.sh — edit config.env and re-run instead of hand-editing.
+# Managed by harden-vps.sh — re-run the script to change these, not by hand.
 Port ${SSH_PORT}
 PermitRootLogin ${PERMIT_ROOT_LOGIN}
 PasswordAuthentication ${PASSWORD_AUTH}
@@ -297,18 +339,31 @@ if is_true "${INSTALL_CLOUDFLARED}"; then
     ok "cloudflared already installed"
   fi
 
-  if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN}" ]]; then
-    # Remotely-managed tunnel: install as a system service from the token.
-    cloudflared service install "${CLOUDFLARED_TUNNEL_TOKEN}" >/dev/null 2>&1 || \
-      warn "cloudflared service install reported an issue — check: journalctl -u cloudflared"
-    systemctl enable --now cloudflared >/dev/null 2>&1 || true
-    ok "cloudflared tunnel service installed and running"
-    CF_STATUS="Tunnel service running (token-based)"
-  else
-    warn "No CLOUDFLARED_TUNNEL_TOKEN set — binary installed but no tunnel configured."
-    warn "Finish later: cloudflared tunnel login && cloudflared tunnel create <name>"
-    warn "or paste a connector token from the Cloudflare Zero Trust dashboard into config.env."
-    CF_STATUS="Binary installed, tunnel not yet configured"
+  # Ask for a connector token only if not pre-set; blank skips tunnel setup.
+  if [[ -z "${CLOUDFLARED_TUNNEL_TOKEN}" ]] && have_tty; then
+    warn "Optional: a Cloudflare Tunnel exposes services with no open inbound ports."
+    warn "Get a connector token from Zero Trust → Networks → Tunnels → Install connector."
+    ask CLOUDFLARED_TUNNEL_TOKEN "Cloudflare Tunnel token (blank to skip)"
+  fi
+
+  CF_STATUS="Binary installed, tunnel not configured"
+  while [[ -n "${CLOUDFLARED_TUNNEL_TOKEN}" ]]; do
+    # `service install` decodes the token locally and registers the service.
+    if cloudflared service install "${CLOUDFLARED_TUNNEL_TOKEN}" >/dev/null 2>&1; then
+      systemctl enable --now cloudflared >/dev/null 2>&1 || true
+      ok "cloudflared tunnel service installed and running"
+      CF_STATUS="Tunnel service running (token-based)"
+      break
+    fi
+    warn "That tunnel token was rejected (malformed or revoked?)."
+    CLOUDFLARED_TUNNEL_TOKEN=""
+    have_tty || { warn "No terminal to re-ask — skipping tunnel setup."; break; }
+    ask CLOUDFLARED_TUNNEL_TOKEN "Cloudflare Tunnel token (blank to skip)"
+  done
+
+  if [[ "${CF_STATUS}" == "Binary installed, tunnel not configured" ]]; then
+    warn "No tunnel configured — binary is ready. Finish later with a token, or:"
+    warn "  cloudflared tunnel login && cloudflared tunnel create <name>"
   fi
 else
   ok "Skipped (INSTALL_CLOUDFLARED=false)"

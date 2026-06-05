@@ -27,30 +27,40 @@ From your laptop, copy this folder up and connect:
 ```bash
 scp -r vps-setup root@<server-ip>:/root/
 ssh root@<server-ip>
+cd vps-setup && ./harden-vps.sh
 ```
 
-On the server:
+There's no config file to edit. The script **asks for what it needs, when it
+needs it** — and re-asks if you give it something it can't use:
+
+- **Username** for the non-root sudo account (re-asks if invalid).
+- **Your SSH public key** — `cat ~/.ssh/id_ed25519.pub` on your laptop
+  (re-asks on bad format; blank is allowed since Tailscale SSH still gets you in).
+- **Tailscale auth key** from
+  https://login.tailscale.com/admin/settings/keys — **re-asks if the key is
+  rejected**. Leave it blank to log in via the browser URL it prints instead.
+- **Cloudflare Tunnel token** *(optional)* from Zero Trust →
+  **Networks → Tunnels → Install connector** — **re-asks if the token is
+  rejected**. Blank skips tunnel setup (the binary is still installed).
+
+Everything else uses secure defaults.
+
+### Unattended / repeatable runs
+
+Pre-set any of the values as environment variables and the script won't prompt
+for them (and will fail fast instead of hanging if one is missing/invalid):
 
 ```bash
-cd vps-setup
-cp config.env.example config.env
-nano config.env          # set USERNAME, SSH_PUBLIC_KEY, Tailscale auth key, etc.
+USERNAME=andres \
+SSH_PUBLIC_KEY="ssh-ed25519 AAAA... you@laptop" \
+TAILSCALE_AUTHKEY="tskey-auth-..." \
 ./harden-vps.sh
 ```
 
-You can also run it with no `config.env` — it'll prompt for the essentials and
-use safe defaults for the rest.
-
-### Get the values you'll need
-
-- **`SSH_PUBLIC_KEY`** — on your laptop: `cat ~/.ssh/id_ed25519.pub` (the whole line).
-- **`TAILSCALE_AUTHKEY`** — https://login.tailscale.com/admin/settings/keys
-  (a reusable/ephemeral key lets the script run unattended; otherwise it does an
-  interactive `tailscale up` and prints a login URL).
-- **`CLOUDFLARED_TUNNEL_TOKEN`** *(optional)* — Cloudflare Zero Trust dashboard →
-  **Networks → Tunnels → Create/Install connector**. With it, the script installs
-  the tunnel as a service automatically. Without it, the binary is installed and
-  you finish the tunnel later.
+Other overridable toggles: `PASSWORDLESS_SUDO`, `TAILSCALE_SSH`,
+`SSH_TAILSCALE_ONLY`, `INSTALL_CLOUDFLARED`, `CLOUDFLARED_TUNNEL_TOKEN`,
+`SSH_PORT`, `PERMIT_ROOT_LOGIN`, `PASSWORD_AUTH`, `F2B_BANTIME`,
+`F2B_FINDTIME`, `F2B_MAXRETRY`, `ENABLE_UNATTENDED_UPGRADES`, `SET_TIMEZONE`.
 
 ## Safety: you can't lock yourself out
 
@@ -59,9 +69,10 @@ use safe defaults for the rest.
   fail2ban) and the script tells you to re-run once Tailscale works.
 - SSH config is written as a **drop-in** and validated with `sshd -t` before
   reload; if it's invalid the drop-in is removed so your current session stays up.
+- It refuses to continue if you'd end up with no key **and** no Tailscale SSH.
 - **Always verify access in a second terminal before closing your root session.**
   The script reminds you at the end.
-- The script is **idempotent** — safe to re-run after fixing config.
+- The script is **idempotent** — safe to re-run after fixing something.
 
 ## After it finishes
 
@@ -75,23 +86,12 @@ Only then close the original root session.
 
 ## Files
 
-| File                   | Purpose                                          |
-|------------------------|--------------------------------------------------|
-| `harden-vps.sh`        | the setup script (run as root)                   |
-| `config.env.example`   | template config — copy to `config.env`           |
-| `config.env`           | **your** settings (gitignored — holds secrets)   |
-| `.gitignore`           | keeps `config.env` and logs out of git           |
+| File              | Purpose                              |
+|-------------------|--------------------------------------|
+| `harden-vps.sh`   | the setup script (run as root)       |
+| `.gitignore`      | keeps run logs out of git            |
 
 A full log of each run is written to `/var/log/harden-vps.log`.
-
-## Customising
-
-Everything is driven by `config.env`. Re-running the script after changing it
-applies the new settings. A few common tweaks:
-
-- Keep public SSH open: `SSH_TAILSCALE_ONLY="false"`.
-- Skip cloudflared: `INSTALL_CLOUDFLARED="false"`.
-- Tighter bans: lower `F2B_MAXRETRY`, raise `F2B_BANTIME`.
 
 ## References / inspiration
 
