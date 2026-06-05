@@ -22,16 +22,15 @@ goes out through a Cloudflare Tunnel, so the firewall stays default-deny.
 
 ## Usage
 
-From your laptop, copy this folder up and connect:
+As root on the fresh server, from inside this repo:
 
 ```bash
-scp -r vps-setup root@<server-ip>:/root/
-ssh root@<server-ip>
-cd vps-setup && ./harden-vps.sh
+./harden-vps.sh
 ```
 
-There's no config file to edit. The script **asks for what it needs, when it
-needs it** — and re-asks if you give it something it can't use:
+There are no flags, config files, or environment variables — every run produces
+the same hardened box. The script **asks for what it needs, when it needs it**,
+and re-asks if you give it something it can't use:
 
 - **Username** for the non-root sudo account (re-asks if invalid).
 - **Your SSH public key** — `cat ~/.ssh/id_ed25519.pub` on your laptop
@@ -39,28 +38,12 @@ needs it** — and re-asks if you give it something it can't use:
 - **Tailscale auth key** from
   https://login.tailscale.com/admin/settings/keys — **re-asks if the key is
   rejected**. Leave it blank to log in via the browser URL it prints instead.
-- **Cloudflare Tunnel token** *(optional)* from Zero Trust →
-  **Networks → Tunnels → Install connector** — **re-asks if the token is
-  rejected**. Blank skips tunnel setup (the binary is still installed).
+- **Cloudflare Tunnel token** from Zero Trust →
+  **Networks → Tunnels → Install connector** — required, and **re-asks until a
+  token successfully registers the tunnel**.
 
-Everything else uses secure defaults.
-
-### Unattended / repeatable runs
-
-Pre-set any of the values as environment variables and the script won't prompt
-for them (and will fail fast instead of hanging if one is missing/invalid):
-
-```bash
-USERNAME=andres \
-SSH_PUBLIC_KEY="ssh-ed25519 AAAA... you@laptop" \
-TAILSCALE_AUTHKEY="tskey-auth-..." \
-./harden-vps.sh
-```
-
-Other overridable toggles: `PASSWORDLESS_SUDO`, `TAILSCALE_SSH`,
-`SSH_TAILSCALE_ONLY`, `INSTALL_CLOUDFLARED`, `CLOUDFLARED_TUNNEL_TOKEN`,
-`SSH_PORT`, `PERMIT_ROOT_LOGIN`, `PASSWORD_AUTH`, `F2B_BANTIME`,
-`F2B_FINDTIME`, `F2B_MAXRETRY`, `ENABLE_UNATTENDED_UPGRADES`, `SET_TIMEZONE`.
+Everything else is fixed policy. To change a hardening decision for all future
+runs, edit the *Fixed policy* constants near the top of `harden-vps.sh`.
 
 ## Safety: you can't lock yourself out
 
@@ -69,7 +52,8 @@ Other overridable toggles: `PASSWORDLESS_SUDO`, `TAILSCALE_SSH`,
   fail2ban) and the script tells you to re-run once Tailscale works.
 - SSH config is written as a **drop-in** and validated with `sshd -t` before
   reload; if it's invalid the drop-in is removed so your current session stays up.
-- It refuses to continue if you'd end up with no key **and** no Tailscale SSH.
+- Tailscale SSH is always enabled, so even a blank SSH key still leaves you a
+  way in over the tailnet (the script warns you when no key is installed).
 - **Always verify access in a second terminal before closing your root session.**
   The script reminds you at the end.
 - The script is **idempotent** — safe to re-run after fixing something.
