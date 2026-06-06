@@ -63,33 +63,22 @@ trap 'die "Failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 # Absolute path to this script, so the re-exec into tmux can find it again.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
-# ── Stage detection ──────────────────────────────────────────────────────────
-# Phase A ("bootstrap") runs as root and creates the user. It then re-execs this
-# same script as  `bash harden-vps.sh run <username>`  inside the user's tmux —
-# that invocation is Phase B ("run"), and carries the username as $2.
-if [[ "${1:-}" == "run" ]]; then
-  # Internal re-exec from the bootstrap phase (carries the username as $2).
-  STAGE="run"; USERNAME="${2:-}"
-elif [[ "${EUID}" -ne 0 ]]; then
-  # Not root and not the internal re-exec. Fine IF we're a sudo-capable user
-  # (e.g. re-running on a box where the user already exists) — run the hardening
-  # as the current user. Otherwise we need root to create the user first.
-  if sudo -n true 2>/dev/null; then
-    STAGE="run"; USERNAME="$(id -un)"
-  else
-    die "First run must be as root (it creates your user). To re-run later, use a sudo-enabled user."
-  fi
-else
+# ── Stage detection (purely by who is running) ───────────────────────────────
+# As root   -> Phase A (bootstrap): create the non-root user, then re-exec this
+#              script as that user inside a tmux session it owns.
+# As a user -> Phase B (run): do the hardening as the current user, via its
+#              passwordless sudo. This covers both the bootstrap's tmux hand-off
+#              and simply re-running the script yourself later.
+if [[ "${EUID}" -eq 0 ]]; then
   STAGE="bootstrap"; USERNAME=""
+else
+  STAGE="run"; USERNAME="$(id -un)"
 fi
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 command -v apt-get >/dev/null 2>&1 || die "This script targets Debian/Ubuntu (apt). Detected something else."
 [[ -t 0 ]] || die "Run this interactively — it asks for a few values (username, SSH key, Tailscale key)."
-if [[ "${STAGE}" == "bootstrap" ]]; then
-  [[ "${EUID}" -eq 0 ]] || die "Run this as root (on a fresh Hetzner box: just \`ssh root@<ip>\`)."
-else
-  [[ -n "${USERNAME}" ]] || die "Internal error: username was not handed to the tmux stage."
+if [[ "${STAGE}" == "run" ]]; then
   sudo -n true 2>/dev/null || die "Passwordless sudo isn't working for '${USERNAME}' — cannot continue."
 fi
 
@@ -193,7 +182,7 @@ if [[ "${STAGE}" == "bootstrap" ]]; then
   # exists (resume). The trailing read keeps the pane open so you can read the
   # summary if you reattach after it finishes.
   exec sudo -u "${USERNAME}" -H tmux new-session -A -s vps-setup \
-    "bash '${SELF}' run '${USERNAME}'; printf '\\n[setup finished — press ENTER to close this tmux session] '; read _"
+    "bash '${SELF}'; printf '\\n[setup finished — press ENTER to close this tmux session] '; read _"
   die "exec into tmux failed"
 fi
 
@@ -202,16 +191,6 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 user_home="/home/${USERNAME}"
 export DEBIAN_FRONTEND=noninteractive
-
-# If we arrived here directly (a sudo user re-running, not via the bootstrap
-# tmux hand-off), wrap ourselves in a user-owned tmux so an SSH drop can't kill
-# the run. The bootstrap path already runs us inside tmux, so this is skipped.
-if [[ -z "${TMUX:-}" ]]; then
-  command -v tmux >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq tmux >/dev/null; }
-  log "Re-launching inside tmux 'vps-setup' (if dropped: reconnect & 'tmux attach -t vps-setup')…"
-  exec tmux new-session -A -s vps-setup \
-    "bash '${SELF}' run '${USERNAME}'; printf '\\n[setup finished — press ENTER to close] '; read _"
-fi
 
 # Mirror all output to the terminal AND append it to a root-owned logfile via
 # sudo tee, so there's a full record of the run.
