@@ -456,21 +456,15 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Persistent-session login hook (written LAST, so reconnects during setup land in
-# a plain shell where `tmux attach -t vps-setup` works without interference).
+# Login shells: source .bashrc so PATH (e.g. ~/.local/bin for Claude) is set.
 # ═════════════════════════════════════════════════════════════════════════════
 profile="${user_home}/.bash_profile"
 cat >> "${profile}" <<'EOF'
 
 # Load .bashrc (PATH like ~/.local/bin, aliases) for login shells too
 if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
-
-# Auto-attach to a persistent tmux session on interactive SSH login
-if command -v tmux >/dev/null 2>&1 && [ -n "$PS1" ] && [ -z "$TMUX" ] && [ -n "$SSH_CONNECTION" ]; then
-  tmux attach -t main 2>/dev/null || tmux new -s main
-fi
 EOF
-ok "Future logins auto-attach to tmux session 'main'"
+ok "Login shells source ~/.bashrc"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Claude Code (for ${USERNAME})"
@@ -523,7 +517,7 @@ echo "  fail2ban .......... ban ${F2B_BANTIME} / ${F2B_MAXRETRY} tries / ${F2B_F
 echo "  Firewall .......... UFW default-deny inbound"
 echo "  cloudflared ....... ${CF_STATUS}"
 echo "  Claude Code ....... ${CLAUDE_STATUS}"
-echo "  tmux .............. auto-attaches to 'main' on login"
+echo "  tmux .............. configured (~/.tmux.conf)"
 echo
 if [[ "${SSH_EXPOSURE}" == "Tailscale only" ]]; then
   echo "  Done. From now on, reach this box over Tailscale:  ssh ${USERNAME}@${TS_IP}"
