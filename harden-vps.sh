@@ -7,10 +7,10 @@
 #     ssh root@<server-ip>
 #     cd vps-setup && ./harden-vps.sh
 #
-# It prompts for the few things it needs — username, your SSH public key, a
-# Tailscale auth key, and a Cloudflare Tunnel token — and re-asks if you give it
-# something invalid. Everything else is fixed policy: every run produces the
-# same hardened result.
+# It prompts for the few things it needs — username, your SSH public key, and a
+# Cloudflare Tunnel token — plus a one-time Tailscale browser login, and re-asks
+# if you give it something invalid. Everything else is fixed policy: every run
+# produces the same hardened result.
 #
 # HOW IT STAYS SAFE
 #
@@ -19,8 +19,8 @@
 #     your SSH connection ever drops mid-run, the work keeps going on the box —
 #     reconnect over Tailscale as that user and `tmux attach -t vps-setup` (no
 #     sudo) to pick it right back up. Privileged steps use the user's passwordless
-#     sudo. (Running as the user also means Claude Code, ~/.tmux.conf, etc. are
-#     installed on the USER's PATH — not root's, where they'd be invisible.)
+#     sudo. (Running as the user also means user-level files like ~/.tmux.conf
+#     are written to the USER's home, not root's.)
 #
 #   • The network lockdown happens LAST and never cuts your only way in. Public
 #     SSH is kept open until you've confirmed, from a second terminal, that you
@@ -34,12 +34,11 @@
 #     3.  fail2ban
 #     4.  cloudflared (Cloudflare Tunnel)
 #     5.  tmux config
-#     6.  Claude Code (installed for the user)
-#     7.  Unattended security upgrades
-#     8.  Tailscale (brought up and VERIFIED)
-#     9.  SSH daemon hardening (key-only, no root login)
-#    10.  UFW firewall — public SSH kept open as a safety net
-#    11.  Lockdown — close public SSH ONLY after you confirm Tailscale works
+#     6.  Unattended security upgrades
+#     7.  Tailscale (brought up and VERIFIED)
+#     8.  SSH daemon hardening (key-only, no root login)
+#     9.  UFW firewall — public SSH kept open as a safety net
+#    10.  Lockdown — close public SSH ONLY after you confirm Tailscale works
 # ─────────────────────────────────────────────────────────────────────────────
 # Fail fast: stop on any error (-e), any unset variable (-u), or any failed
 # command in a pipe (pipefail). -E makes the ERR trap below also fire inside
@@ -201,8 +200,6 @@ echo "│  Hetzner VPS hardening & setup                │"
 echo "╰──────────────────────────────────────────────╯"
 echo "   user: ${USERNAME}   session: tmux 'vps-setup'   log: ${LOG_FILE}"
 
-CLAUDE_STATUS="not installed"
-
 # ═════════════════════════════════════════════════════════════════════════════
 section "System update & base packages"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -298,28 +295,6 @@ EOF
 ok "Wrote ${user_home}/.tmux.conf"
 
 # ═════════════════════════════════════════════════════════════════════════════
-section "Claude Code (for ${USERNAME})"
-# ═════════════════════════════════════════════════════════════════════════════
-# Installed AS the user (we're running as the user), so the binary lands in
-# ~/.local/bin and is on THIS user's PATH. Claude Code refuses to run as root,
-# so a root-time install is both wrong and invisible here — that's the trap.
-curl -fsSL https://claude.ai/install.sh | bash || true
-if [[ -x "${user_home}/.local/bin/claude" ]]; then
-  # Make sure ~/.local/bin is on PATH for future shells (the installer usually
-  # adds it; this is belt-and-suspenders).
-  if ! grep -q '.local/bin' "${user_home}/.bashrc" 2>/dev/null; then
-    printf '\n# user-local binaries (Claude Code, etc.)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "${user_home}/.bashrc"
-  fi
-  ok "Claude Code installed at ~/.local/bin/claude"
-  warn "First use: run 'claude' (as ${USERNAME}) to authenticate."
-  CLAUDE_STATUS="installed (run 'claude' to log in)"
-else
-  warn "Claude Code install didn't complete (network?). Re-run later as ${USERNAME}:"
-  warn "   curl -fsSL https://claude.ai/install.sh | bash"
-  CLAUDE_STATUS="not installed — run the installer as ${USERNAME}"
-fi
-
-# ═════════════════════════════════════════════════════════════════════════════
 section "Unattended security upgrades"
 # ═════════════════════════════════════════════════════════════════════════════
 sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
@@ -341,33 +316,20 @@ ok "Tailscale installed"
 sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
 
 echo
-warn "── TAILSCALE auth key ───────────────────────────────────────────────"
-warn "What:  a one-off key that joins THIS server to your private tailnet."
+warn "── TAILSCALE login (browser) ────────────────────────────────────────"
+warn "What:  joins THIS server to your private tailnet via a browser login."
 warn "Why:   Tailscale becomes the private path to SSH — public port 22 is closed"
 warn "       at the very end, only after you've confirmed Tailscale SSH works."
-warn "Where: https://login.tailscale.com/admin/settings/keys → 'Generate auth key'"
-warn "       (reusable or ephemeral is fine). Blank = log in via a browser URL"
-warn "       this script prints instead."
-TAILSCALE_AUTHKEY=""
+warn "How:   tailscale prints a URL below — open it, sign in, and approve this"
+warn "       machine. The script waits, then continues automatically."
+echo
+# --operator lets '${USERNAME}' run tailscale without sudo afterwards.
 while :; do
-  if [[ -z "${TAILSCALE_AUTHKEY}" ]]; then
-    ask TAILSCALE_AUTHKEY "Tailscale auth key (blank for browser login)" silent
+  if sudo tailscale up --ssh --operator="${USERNAME}"; then
+    break
   fi
-  # --operator lets '${USERNAME}' run tailscale without sudo afterwards.
-  if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
-    if sudo tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh --operator="${USERNAME}"; then
-      break
-    fi
-    warn "Tailscale rejected that auth key (expired, wrong, or already used?)."
-    TAILSCALE_AUTHKEY=""
-  else
-    warn "Starting interactive Tailscale login — open the URL it prints and approve this machine."
-    if sudo tailscale up --ssh --operator="${USERNAME}"; then
-      break
-    fi
-    warn "Interactive Tailscale login didn't complete."
-    ask_retry "Try Tailscale login again?" || break
-  fi
+  warn "Tailscale login didn't complete."
+  ask_retry "Try Tailscale login again?" || break
 done
 
 # Verify Tailscale is actually connected before we trust it for the lockdown.
@@ -528,7 +490,6 @@ echo "  SSH auth .......... key-only (passwords: ${PASSWORD_AUTH}, root: ${PERMI
 echo "  fail2ban .......... ban ${F2B_BANTIME} / ${F2B_MAXRETRY} tries / ${F2B_FINDTIME}"
 echo "  Firewall .......... UFW default-deny inbound"
 echo "  cloudflared ....... ${CF_STATUS}"
-echo "  Claude Code ....... ${CLAUDE_STATUS}"
 echo "  tmux .............. auto-attaches to 'main' on login"
 echo
 if [[ "${SSH_EXPOSURE}" == "Tailscale only" ]]; then

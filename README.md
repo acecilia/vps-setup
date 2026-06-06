@@ -36,9 +36,9 @@ and re-asks if you give it something it can't use:
 - **Your SSH public key** — `cat ~/.ssh/id_ed25519.pub` on your laptop.
   **Required** (re-asks on bad format). Tailscale restricts *where* SSH is
   reachable from; this key proves *who* you are.
-- **Tailscale auth key** from
-  https://login.tailscale.com/admin/settings/keys — **re-asks if the key is
-  rejected**. Leave it blank to log in via the browser URL it prints instead.
+- **Tailscale login** — the script runs `tailscale up` and prints a URL; open
+  it, sign in, and approve the machine. No auth key needed. (Re-asks to retry if
+  the login doesn't complete.)
 - **Cloudflare Tunnel token** from Zero Trust →
   **Networks → Tunnels → Install connector** — required, and **re-asks until a
   token successfully registers the tunnel**.
