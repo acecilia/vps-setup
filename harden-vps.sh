@@ -12,20 +12,30 @@
 # something invalid. Everything else is fixed policy: every run produces the
 # same hardened result. There are no flags or environment variables to set.
 #
-# What it does, in order:
+# Two safety properties, learned the hard way:
+#
+#   • SURVIVES SSH DROPS. The script re-launches itself inside a tmux session on
+#     the server. If your SSH connection ever drops mid-run, the work keeps going
+#     on the box — just reconnect and `tmux attach -t vps-setup` to pick it up.
+#     (Without this, a dropped connection sends SIGHUP and the run dies half-done.)
+#
+#   • NEVER CUTS YOUR ONLY WAY IN. All the safe configuration happens first; the
+#     network lockdown happens last. Public SSH is kept OPEN until you've proven,
+#     from a second terminal, that you can log in over Tailscale. Only then does
+#     the script close port 22. If you can't confirm, public SSH stays open
+#     (still key-only + fail2ban) rather than stranding you.
+#
+# Order of operations:
 #   1.  System update + base packages
 #   2.  Non-root sudo user + your SSH key
-#   3.  Tailscale  (brought up and VERIFIED before anything is locked down)
-#   4.  SSH daemon hardening (key-only, no root login)
-#   5.  fail2ban   (brute-force protection for SSH)
-#   6.  UFW firewall — SSH restricted to the tailscale0 interface only
-#   7.  cloudflared (Cloudflare Tunnel — expose services with no open ports)
-#   8.  tmux       (persistent sessions config for the user)
-#   9.  Unattended security upgrades
-#
-# Safety: the firewall is only locked to Tailscale AFTER Tailscale is confirmed
-# connected. If Tailscale isn't up, public SSH is kept open so you can't get
-# locked out. It's meant to run once, on a freshly provisioned box.
+#   3.  fail2ban   (brute-force protection for SSH)
+#   4.  cloudflared (Cloudflare Tunnel — expose services with no open ports)
+#   5.  tmux       (persistent sessions config for the user)
+#   6.  Unattended security upgrades
+#   7.  Tailscale  (brought up and VERIFIED)
+#   8.  SSH daemon hardening (key-only, no root login)
+#   9.  UFW firewall — public SSH kept open as a safety net
+#  10.  Lockdown — close public SSH ONLY after you confirm Tailscale works
 # ─────────────────────────────────────────────────────────────────────────────
 # Fail fast: stop on any error (-e), any unset variable (-u), or any failed
 # command in a pipe (pipefail). -E makes the ERR trap below also fire inside
@@ -51,6 +61,24 @@ trap 'die "Failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 command -v apt-get >/dev/null 2>&1 || die "This script targets Debian/Ubuntu (apt). Detected something else."
 [[ -t 0 ]] || die "Run this interactively — it asks for a few values (username, SSH key, Tailscale key)."
 
+# ── Survive SSH drops: run inside tmux ───────────────────────────────────────
+# The script runs *inside* your SSH session, so if a later step ever interrupts
+# the connection the shell would get SIGHUP and the run would die half-finished.
+# Re-exec inside a tmux session so the run keeps going on the server even if your
+# SSH connection drops — reconnect and `tmux attach -t vps-setup` to resume.
+if [[ -z "${TMUX:-}" ]]; then
+  command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq tmux >/dev/null; }
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  echo ":: Re-launching inside tmux session 'vps-setup' so this survives an SSH drop."
+  echo "   If you get disconnected: reconnect to the server, then run  tmux attach -t vps-setup"
+  echo
+  # -A: attach if the session already exists (e.g. resuming after a drop),
+  # otherwise create it and run the script. The trailing read keeps the pane
+  # open after the script finishes so you can read the summary if you reattach.
+  exec tmux new-session -A -s vps-setup \
+    "bash '${self}'; printf '\n[setup finished — press ENTER to close this tmux session] '; read _"
+fi
+
 # Send all output (stdout + stderr) to the terminal AND append it to a logfile
 # via `tee`, so there's a full record of the run to look at afterwards.
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -58,7 +86,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "╭──────────────────────────────────────────────╮"
 echo "│  Hetzner VPS hardening & setup                │"
 echo "╰──────────────────────────────────────────────╯"
-echo "   log: ${LOG_FILE}"
+echo "   log: ${LOG_FILE}   (running inside tmux session 'vps-setup')"
 
 # ── What the script asks you for ─────────────────────────────────────────────
 # These four are the only inputs. Each is prompted for when it's needed and
@@ -119,15 +147,19 @@ apt-get update -qq
 apt-get upgrade -y -qq
 # Bare minimum: only the services the script configures. curl + CA certs are
 # assumed already present (they are on stock images); Tailscale and cloudflared
-# pull their own dependencies.
+# pull their own dependencies. (tmux is already installed by the re-exec above.)
 apt-get install -y -qq ufw fail2ban tmux unattended-upgrades >/dev/null
 ok "Base packages installed"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Non-root sudo user: ${USERNAME}"
 # ═════════════════════════════════════════════════════════════════════════════
-adduser --disabled-password --gecos "" "${USERNAME}"
-ok "Created user '${USERNAME}'"
+if id "${USERNAME}" >/dev/null 2>&1; then
+  ok "User '${USERNAME}' already exists — reusing it"
+else
+  adduser --disabled-password --gecos "" "${USERNAME}"
+  ok "Created user '${USERNAME}'"
+fi
 usermod -aG sudo "${USERNAME}"
 ok "Added '${USERNAME}' to sudo group"
 
@@ -162,92 +194,6 @@ chmod 600 "${auth}"; chown "${USERNAME}:${USERNAME}" "${auth}"
 ok "Installed SSH key for ${USERNAME}"
 
 # ═════════════════════════════════════════════════════════════════════════════
-section "Tailscale"
-# ═════════════════════════════════════════════════════════════════════════════
-curl -fsSL https://tailscale.com/install.sh | sh
-ok "Tailscale installed"
-systemctl enable --now tailscaled >/dev/null 2>&1 || true
-
-# Bring Tailscale up. If an auth key is rejected, say so and re-ask (or fall back
-# to browser login). Loops until the box is actually on the tailnet.
-echo
-warn "── TAILSCALE auth key ───────────────────────────────────────────────"
-warn "What:  a one-off key that joins THIS server to your private tailnet."
-warn "Why:   Tailscale becomes the only network path to SSH — port 22 is later"
-warn "       firewalled to the tailscale0 interface, so the box is never exposed"
-warn "       to the public internet."
-warn "Where: https://login.tailscale.com/admin/settings/keys → 'Generate auth key'"
-warn "       (reusable or ephemeral is fine). Blank = log in via a browser URL"
-warn "       this script prints instead."
-while :; do
-  if [[ -z "${TAILSCALE_AUTHKEY}" ]]; then
-    ask TAILSCALE_AUTHKEY "Tailscale auth key (blank for browser login)" silent
-  fi
-
-  if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
-    if tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh; then
-      break
-    fi
-    warn "Tailscale rejected that auth key (expired, wrong, or already used?)."
-    TAILSCALE_AUTHKEY=""
-    # loop re-asks for a fresh key
-  else
-    warn "Starting interactive Tailscale login — open the URL it prints and approve this machine."
-    if tailscale up --ssh; then
-      break
-    fi
-    warn "Interactive Tailscale login didn't complete."
-    ask_retry "Try Tailscale login again?" || break
-  fi
-done
-
-# Verify Tailscale is actually connected before we trust it for the firewall.
-TS_CONNECTED="false"
-TS_IP=""
-if tailscale status >/dev/null 2>&1; then
-  TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-  [[ -n "${TS_IP}" ]] && TS_CONNECTED="true"
-fi
-if is_true "${TS_CONNECTED}"; then
-  ok "Tailscale is up — this machine is ${TS_IP}"
-else
-  warn "Could not confirm Tailscale connectivity. Public SSH will be kept OPEN as a safety net."
-fi
-
-# ═════════════════════════════════════════════════════════════════════════════
-section "SSH daemon hardening"
-# ═════════════════════════════════════════════════════════════════════════════
-# Drop-in config so we never clobber the distro's sshd_config.
-sshd_drop="/etc/ssh/sshd_config.d/99-hardening.conf"
-install -d -m 755 /etc/ssh/sshd_config.d
-cat > "${sshd_drop}" <<EOF
-# Managed by harden-vps.sh — re-run the script to change these, not by hand.
-Port ${SSH_PORT}
-PermitRootLogin ${PERMIT_ROOT_LOGIN}
-PasswordAuthentication ${PASSWORD_AUTH}
-PubkeyAuthentication yes
-KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
-AuthenticationMethods publickey
-AllowUsers ${USERNAME} root
-MaxAuthTries 3
-MaxSessions 5
-LoginGraceTime 30
-X11Forwarding no
-ClientAliveInterval 300
-ClientAliveCountMax 2
-EOF
-ok "Wrote ${sshd_drop}"
-
-if sshd -t; then
-  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh
-  ok "SSH config valid and reloaded (root login: ${PERMIT_ROOT_LOGIN}, passwords: ${PASSWORD_AUTH})"
-else
-  rm -f "${sshd_drop}"
-  die "sshd config test failed — reverted the drop-in so you keep your current session."
-fi
-
-# ═════════════════════════════════════════════════════════════════════════════
 section "fail2ban (SSH brute-force protection)"
 # ═════════════════════════════════════════════════════════════════════════════
 cat > /etc/fail2ban/jail.local <<EOF
@@ -270,31 +216,6 @@ EOF
 systemctl enable fail2ban >/dev/null 2>&1
 systemctl restart fail2ban
 ok "fail2ban active (ban ${F2B_BANTIME} after ${F2B_MAXRETRY} fails in ${F2B_FINDTIME})"
-
-# ═════════════════════════════════════════════════════════════════════════════
-section "UFW firewall"
-# ═════════════════════════════════════════════════════════════════════════════
-ufw --force reset >/dev/null
-ufw default deny incoming  >/dev/null
-ufw default allow outgoing >/dev/null
-
-# Allow everything over the Tailscale interface — your trusted path in.
-ufw allow in on tailscale0 comment 'Tailscale mesh' >/dev/null
-
-if is_true "${TS_CONNECTED}"; then
-  # SSH reachable ONLY through Tailscale — public port 22 stays invisible.
-  ok "SSH locked to tailscale0 — public port ${SSH_PORT} is closed"
-  SSH_EXPOSURE="Tailscale only"
-else
-  # Safety net: Tailscale unconfirmed, so keep public SSH open (key-only + fail2ban).
-  ufw allow "${SSH_PORT}/tcp" comment 'SSH (public — Tailscale not confirmed)' >/dev/null
-  warn "Tailscale wasn't confirmed — left public SSH OPEN so you aren't locked out."
-  warn "Once Tailscale works: run 'tailscale up --ssh', then 'ufw delete allow ${SSH_PORT}/tcp'."
-  SSH_EXPOSURE="Public (key-only + fail2ban)"
-fi
-
-ufw --force enable >/dev/null
-ok "UFW enabled — default-deny inbound"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "cloudflared (Cloudflare Tunnel)"
@@ -334,7 +255,6 @@ CF_STATUS="Tunnel service running (token-based)"
 # ═════════════════════════════════════════════════════════════════════════════
 section "tmux (persistent sessions)"
 # ═════════════════════════════════════════════════════════════════════════════
-user_home="/home/${USERNAME}"
 tmux_conf="${user_home}/.tmux.conf"
 cat > "${tmux_conf}" <<'EOF'
 # ── tmux: keep long-running work alive across SSH drops ──────────────────────
@@ -360,14 +280,16 @@ ok "Wrote ${tmux_conf}"
 
 # Auto-create a 'main' tmux session at login so work survives disconnects.
 profile_d="${user_home}/.bash_profile"
-cat >> "${profile_d}" <<'EOF'
+if ! grep -q "tmux attach -t main" "${profile_d}" 2>/dev/null; then
+  cat >> "${profile_d}" <<'EOF'
 
 # Auto-attach to a persistent tmux session on interactive SSH login
 if command -v tmux >/dev/null 2>&1 && [ -n "$PS1" ] && [ -z "$TMUX" ] && [ -n "$SSH_CONNECTION" ]; then
   tmux attach -t main 2>/dev/null || tmux new -s main
 fi
 EOF
-chown "${USERNAME}:${USERNAME}" "${profile_d}"
+  chown "${USERNAME}:${USERNAME}" "${profile_d}"
+fi
 ok "Login auto-attaches to tmux session 'main'"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -380,6 +302,170 @@ APT::Periodic::AutocleanInterval "7";
 EOF
 systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 ok "Automatic security updates enabled"
+
+# ═════════════════════════════════════════════════════════════════════════════
+section "Tailscale"
+# ═════════════════════════════════════════════════════════════════════════════
+# NOTE: bringing Tailscale up can briefly disturb networking. That's exactly why
+# the script runs inside tmux (so a blip won't kill it) and why the firewall
+# below keeps public SSH open until you've verified Tailscale works.
+curl -fsSL https://tailscale.com/install.sh | sh
+ok "Tailscale installed"
+systemctl enable --now tailscaled >/dev/null 2>&1 || true
+
+echo
+warn "── TAILSCALE auth key ───────────────────────────────────────────────"
+warn "What:  a one-off key that joins THIS server to your private tailnet."
+warn "Why:   Tailscale becomes the private path to SSH — public port 22 is closed"
+warn "       at the very end, only after you've confirmed Tailscale SSH works."
+warn "Where: https://login.tailscale.com/admin/settings/keys → 'Generate auth key'"
+warn "       (reusable or ephemeral is fine). Blank = log in via a browser URL"
+warn "       this script prints instead."
+while :; do
+  if [[ -z "${TAILSCALE_AUTHKEY}" ]]; then
+    ask TAILSCALE_AUTHKEY "Tailscale auth key (blank for browser login)" silent
+  fi
+
+  if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
+    if tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh; then
+      break
+    fi
+    warn "Tailscale rejected that auth key (expired, wrong, or already used?)."
+    TAILSCALE_AUTHKEY=""
+    # loop re-asks for a fresh key
+  else
+    warn "Starting interactive Tailscale login — open the URL it prints and approve this machine."
+    if tailscale up --ssh; then
+      break
+    fi
+    warn "Interactive Tailscale login didn't complete."
+    ask_retry "Try Tailscale login again?" || break
+  fi
+done
+
+# Verify Tailscale is actually connected before we trust it for the lockdown.
+TS_CONNECTED="false"
+TS_IP=""
+if tailscale status >/dev/null 2>&1; then
+  TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+  [[ -n "${TS_IP}" ]] && TS_CONNECTED="true"
+fi
+if is_true "${TS_CONNECTED}"; then
+  ok "Tailscale is up — this machine is ${TS_IP}"
+else
+  warn "Could not confirm Tailscale connectivity. Public SSH will be kept OPEN as a safety net."
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+section "SSH daemon hardening"
+# ═════════════════════════════════════════════════════════════════════════════
+# Drop-in config so we never clobber the distro's sshd_config. A reload does NOT
+# drop existing sessions, so your current root shell stays alive.
+sshd_drop="/etc/ssh/sshd_config.d/99-hardening.conf"
+install -d -m 755 /etc/ssh/sshd_config.d
+cat > "${sshd_drop}" <<EOF
+# Managed by harden-vps.sh — re-run the script to change these, not by hand.
+Port ${SSH_PORT}
+PermitRootLogin ${PERMIT_ROOT_LOGIN}
+PasswordAuthentication ${PASSWORD_AUTH}
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+AuthenticationMethods publickey
+AllowUsers ${USERNAME} root
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 30
+X11Forwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+ok "Wrote ${sshd_drop}"
+
+if sshd -t; then
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh
+  ok "SSH config valid and reloaded (root login: ${PERMIT_ROOT_LOGIN}, passwords: ${PASSWORD_AUTH})"
+else
+  rm -f "${sshd_drop}"
+  die "sshd config test failed — reverted the drop-in so you keep your current session."
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+section "UFW firewall"
+# ═════════════════════════════════════════════════════════════════════════════
+ufw --force reset >/dev/null
+ufw default deny incoming  >/dev/null
+ufw default allow outgoing >/dev/null
+
+# Allow everything over the Tailscale interface — your trusted path in.
+ufw allow in on tailscale0 comment 'Tailscale mesh' >/dev/null
+
+# IMPORTANT: keep public SSH OPEN for now. The lockdown step below closes it only
+# after you've confirmed a working Tailscale login, so a dropped connection can
+# never strand you. UFW permits already-established connections, so enabling it
+# here does not cut your current session either.
+ufw allow "${SSH_PORT}/tcp" comment 'SSH (public — closed after Tailscale verified)' >/dev/null
+ufw --force enable >/dev/null
+ok "UFW enabled — default-deny inbound; SSH reachable via Tailscale AND public ${SSH_PORT} for now"
+
+# ═════════════════════════════════════════════════════════════════════════════
+section "Lockdown — close public SSH (only after you verify Tailscale)"
+# ═════════════════════════════════════════════════════════════════════════════
+if is_true "${TS_CONNECTED}"; then
+  echo
+  warn "Everything is configured and SSH is hardened, but public port ${SSH_PORT} is"
+  warn "still OPEN on purpose. Prove you can get in over Tailscale BEFORE closing it:"
+  echo
+  echo "     1. Leave this tmux session running (don't close this terminal)."
+  echo "     2. On a device joined to your tailnet, open a NEW terminal and run:"
+  echo
+  echo "            ssh ${USERNAME}@${TS_IP}"
+  echo
+  echo "        Use the new user '${USERNAME}' (root login is disabled) with your SSH key."
+  echo "     3. Confirm you get a shell and that 'sudo whoami' prints 'root'."
+  echo
+  warn "If your laptop isn't on Tailscale yet: install it and 'tailscale up' first."
+  echo
+  while :; do
+    ask GATE "Type 'lock' once Tailscale SSH works — or 'skip' to leave public SSH open"
+    case "${GATE,,}" in
+      lock|locked|y|yes)
+        echo
+        warn "About to CLOSE public port ${SSH_PORT}. Here's what happens next:"
+        echo "     • If THIS terminal is connected over the public IP, it may freeze or"
+        echo "       disconnect the moment the port closes."
+        echo "     • That's fine — the setup is running inside tmux ON THE SERVER, so it"
+        echo "       does NOT die. It finishes regardless, and the result is in the log:"
+        echo "         ${LOG_FILE}"
+        echo "     • To get back to this session, reconnect over Tailscale and reattach:"
+        echo
+        echo "            ssh ${USERNAME}@${TS_IP}"
+        echo "            tmux attach -t vps-setup"
+        echo
+        echo "       (If you're ALREADY connected over Tailscale, nothing drops — you'll"
+        echo "        just fall through to the summary below.)"
+        echo
+        read -rp "   Press ENTER to close public SSH now (or Ctrl-C to abort and keep it open)... " _
+        ufw delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+        ufw reload >/dev/null 2>&1 || true
+        ok "Public port ${SSH_PORT} closed — SSH is now reachable ONLY over Tailscale."
+        SSH_EXPOSURE="Tailscale only"
+        break ;;
+      skip|s|n|no)
+        warn "Leaving public SSH OPEN (still key-only + fail2ban)."
+        warn "Close it later, once Tailscale works, with:  sudo ufw delete allow ${SSH_PORT}/tcp"
+        SSH_EXPOSURE="Public (key-only + fail2ban)"
+        break ;;
+      *)
+        warn "Please type 'lock' (close public SSH) or 'skip' (keep it open)." ;;
+    esac
+  done
+else
+  warn "Tailscale was not confirmed — leaving public SSH OPEN so you aren't locked out."
+  warn "Once Tailscale works (tailscale up --ssh) and you've verified  ssh ${USERNAME}@<tailscale-ip> ,"
+  warn "close public SSH with:  sudo ufw delete allow ${SSH_PORT}/tcp"
+  SSH_EXPOSURE="Public (key-only + fail2ban)"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary
@@ -399,17 +485,10 @@ echo "  Firewall .......... UFW default-deny inbound"
 echo "  cloudflared ....... ${CF_STATUS}"
 echo "  tmux .............. auto-attaches to 'main' on login"
 echo
-echo "Next steps — KEEP THIS SESSION OPEN and verify in a NEW terminal:"
-if [[ -n "${TS_IP}" ]]; then
-  echo "  1. New terminal:  ssh ${USERNAME}@${TS_IP}   (over Tailscale)"
+if [[ "${SSH_EXPOSURE}" == "Tailscale only" ]]; then
+  echo "  Done. From now on, reach this box over Tailscale:  ssh ${USERNAME}@${TS_IP}"
 else
-  echo "  1. Get on Tailscale, then:  ssh ${USERNAME}@<tailscale-ip>"
-fi
-echo "  2. Confirm sudo works:  sudo whoami   → should print 'root'"
-echo "  3. Only once that works, you may close this root session."
-if ! is_true "${TS_CONNECTED}"; then
-  echo
-  echo "  ⚠ Public SSH is still OPEN because Tailscale wasn't confirmed."
-  echo "    Fix Tailscale (tailscale up --ssh), then: ufw delete allow ${SSH_PORT}/tcp"
+  echo "  Public SSH is still open. Verify  ssh ${USERNAME}@${TS_IP:-<tailscale-ip>}  works,"
+  echo "  then close it with:  sudo ufw delete allow ${SSH_PORT}/tcp"
 fi
 echo

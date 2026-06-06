@@ -48,18 +48,25 @@ runs, edit the *Fixed policy* constants near the top of `harden-vps.sh`.
 
 ## Safety: you can't lock yourself out
 
-- The firewall is only restricted to Tailscale **after** Tailscale is confirmed
-  connected. If it isn't, **public SSH is left open** (still key-only +
-  fail2ban) and the script tells you how to close port 22 once Tailscale works.
+- **It survives an SSH drop.** The script re-launches itself inside a `tmux`
+  session on the server, so if your connection ever dies mid-run the work keeps
+  going on the box. Reconnect and `tmux attach -t vps-setup` to pick it back up.
+  (Without this, a dropped connection sends `SIGHUP` and the run dies half-done —
+  leaving the box partially configured.)
+- **Public SSH stays open until you've proven Tailscale works.** All the safe
+  configuration runs first; the network lockdown is last. After Tailscale is up
+  and SSH is hardened, the script *stops* and asks you to open a **second
+  terminal**, `ssh <user>@<tailscale-ip>`, and confirm you get in. Only when you
+  type `lock` does it close public port 22. Type `skip` (or if Tailscale can't be
+  confirmed) and public SSH is left open — still key-only + fail2ban — rather
+  than stranding you.
+- **It warns before it cuts you off.** Right before closing port 22 it explains
+  what's about to happen and prints the exact commands to reconnect over
+  Tailscale and reattach to the running `tmux` session.
 - SSH config is written as a **drop-in** and validated with `sshd -t` before
   reload; if it's invalid the drop-in is removed so your current session stays up.
-- Your SSH key is installed **before** SSH is hardened, so you always have a
-  working login; SSH is then restricted to the Tailscale interface only after
-  Tailscale is confirmed connected.
-- **Always verify access in a second terminal before closing your root session.**
-  The script reminds you at the end.
-- It's meant to run **once on a freshly provisioned box** (it assumes the user
-  and config don't already exist).
+  A reload never drops existing sessions, so your root shell stays alive.
+- It's meant to run **once on a freshly provisioned box**.
 
 ## After it finishes
 
