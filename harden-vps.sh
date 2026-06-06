@@ -495,6 +495,17 @@ else
   CLAUDE_STATUS="not installed — run the installer as ${USERNAME}"
 fi
 
+# Run Claude in autonomous (bypass-permissions) mode by default — this box is
+# disposable and sealed behind Tailscale. Written for the user (bypass mode is
+# refused as root). Applies whether or not the install above succeeded.
+mkdir -p "${user_home}/.claude"
+cat > "${user_home}/.claude/settings.json" <<'EOF'
+{
+  "permissions": { "defaultMode": "bypassPermissions" }
+}
+EOF
+ok "Claude set to bypassPermissions (autonomous) mode — plain 'claude' skips prompts"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════════════════════════════════════
