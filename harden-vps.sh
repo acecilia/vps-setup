@@ -409,6 +409,10 @@ if is_true "${TS_CONNECTED}"; then
   echo
   echo "        Use the new user '${USERNAME}' (root login is disabled) with your SSH key."
   echo "     3. Confirm you get a shell and that 'sudo whoami' prints 'root'."
+  echo "     4. Come back to this prompt to answer. You can answer from EITHER place:"
+  echo "          • this original terminal, or"
+  echo "          • the new Tailscale session — reattach to this script with:"
+  echo "                tmux attach -t vps-setup"
   echo
   warn "If your laptop isn't on Tailscale yet: install it and 'tailscale up' first."
   echo
