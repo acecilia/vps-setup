@@ -22,9 +22,12 @@ goes out through a Cloudflare Tunnel, so the firewall stays default-deny.
 
 ## Usage
 
-As root on the fresh server, from inside this repo:
+As root on the fresh server, fetch the script and run it (download to a file —
+**not** `curl | bash`: the script re-execs itself from disk for the tmux hand-off):
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/acecilia/vps-setup/main/harden-vps.sh -o harden-vps.sh
+chmod +x harden-vps.sh
 ./harden-vps.sh
 ```
 
