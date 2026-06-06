@@ -135,13 +135,9 @@ if [[ "${STAGE}" == "bootstrap" ]]; then
     ask USERNAME "Username for the non-root sudo account"
   done
 
-  # Create the user (idempotent) + passwordless sudo.
-  if id "${USERNAME}" >/dev/null 2>&1; then
-    ok "User '${USERNAME}' already exists — reusing it"
-  else
-    adduser --disabled-password --gecos "" "${USERNAME}"
-    ok "Created user '${USERNAME}'"
-  fi
+  # Create the user + passwordless sudo. (Fresh-box, run-once: no exists-guard.)
+  adduser --disabled-password --gecos "" "${USERNAME}"
+  ok "Created user '${USERNAME}'"
   usermod -aG sudo "${USERNAME}"
   echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-${USERNAME}"
   chmod 440 "/etc/sudoers.d/90-${USERNAME}"
@@ -460,8 +456,7 @@ fi
 # a plain shell where `tmux attach -t vps-setup` works without interference).
 # ═════════════════════════════════════════════════════════════════════════════
 profile="${user_home}/.bash_profile"
-if ! grep -q "tmux attach -t main" "${profile}" 2>/dev/null; then
-  cat >> "${profile}" <<'EOF'
+cat >> "${profile}" <<'EOF'
 
 # Load .bashrc (PATH like ~/.local/bin, aliases) for login shells too
 if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
@@ -471,7 +466,6 @@ if command -v tmux >/dev/null 2>&1 && [ -n "$PS1" ] && [ -z "$TMUX" ] && [ -n "$
   tmux attach -t main 2>/dev/null || tmux new -s main
 fi
 EOF
-fi
 ok "Future logins auto-attach to tmux session 'main'"
 
 # ═════════════════════════════════════════════════════════════════════════════
