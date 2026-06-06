@@ -50,9 +50,11 @@ runs, edit the *Fixed policy* constants near the top of `harden-vps.sh`.
 
 - **It survives an SSH drop.** The script re-launches itself inside a `tmux`
   session on the server, so if your connection ever dies mid-run the work keeps
-  going on the box. Reconnect and `tmux attach -t vps-setup` to pick it back up.
-  (Without this, a dropped connection sends `SIGHUP` and the run dies half-done —
-  leaving the box partially configured.)
+  going on the box. The session runs as **root**, so once the non-root user
+  exists (and root SSH is disabled) you reconnect as that user and reattach with
+  `sudo tmux attach -t vps-setup`. (Without the tmux wrapper, a dropped
+  connection sends `SIGHUP` and the run dies half-done — leaving the box
+  partially configured.)
 - **Public SSH stays open until you've proven Tailscale works.** All the safe
   configuration runs first; the network lockdown is last. After Tailscale is up
   and SSH is hardened, the script *stops* and asks you to open a **second

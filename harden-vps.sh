@@ -70,7 +70,10 @@ if [[ -z "${TMUX:-}" ]]; then
   command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq tmux >/dev/null; }
   self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   echo ":: Re-launching inside tmux session 'vps-setup' so this survives an SSH drop."
-  echo "   If you get disconnected: reconnect to the server, then run  tmux attach -t vps-setup"
+  echo "   If you get disconnected, reconnect and reattach. The session runs as root,"
+  echo "   so once the non-root user exists you reattach through sudo:"
+  echo "       ssh <user>@<server>            # (or root, until SSH is hardened)"
+  echo "       sudo tmux attach -t vps-setup"
   echo
   # -A: attach if the session already exists (e.g. resuming after a drop),
   # otherwise create it and run the script. The trailing read keeps the pane
@@ -437,11 +440,15 @@ if is_true "${TS_CONNECTED}"; then
         echo "     • That's fine — the setup is running inside tmux ON THE SERVER, so it"
         echo "       does NOT die. It finishes regardless, and the result is in the log:"
         echo "         ${LOG_FILE}"
-        echo "     • To get back to this session, reconnect over Tailscale and reattach:"
+        echo "     • To get back to this session, reconnect over Tailscale and reattach."
+        echo "       It runs as root, but you log in as '${USERNAME}' (root SSH is off),"
+        echo "       so reattach through sudo:"
         echo
         echo "            ssh ${USERNAME}@${TS_IP}"
-        echo "            tmux attach -t vps-setup"
+        echo "            sudo tmux attach -t vps-setup"
         echo
+        echo "       (If login drops you into your own 'main' tmux first, press Ctrl-b"
+        echo "        then d to detach, then run the sudo line above.)"
         echo "       (If you're ALREADY connected over Tailscale, nothing drops — you'll"
         echo "        just fall through to the summary below.)"
         echo
