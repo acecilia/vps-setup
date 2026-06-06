@@ -68,7 +68,17 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 # same script as  `bash harden-vps.sh run <username>`  inside the user's tmux —
 # that invocation is Phase B ("run"), and carries the username as $2.
 if [[ "${1:-}" == "run" ]]; then
+  # Internal re-exec from the bootstrap phase (carries the username as $2).
   STAGE="run"; USERNAME="${2:-}"
+elif [[ "${EUID}" -ne 0 ]]; then
+  # Not root and not the internal re-exec. Fine IF we're a sudo-capable user
+  # (e.g. re-running on a box where the user already exists) — run the hardening
+  # as the current user. Otherwise we need root to create the user first.
+  if sudo -n true 2>/dev/null; then
+    STAGE="run"; USERNAME="$(id -un)"
+  else
+    die "First run must be as root (it creates your user). To re-run later, use a sudo-enabled user."
+  fi
 else
   STAGE="bootstrap"; USERNAME=""
 fi
@@ -192,6 +202,16 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 user_home="/home/${USERNAME}"
 export DEBIAN_FRONTEND=noninteractive
+
+# If we arrived here directly (a sudo user re-running, not via the bootstrap
+# tmux hand-off), wrap ourselves in a user-owned tmux so an SSH drop can't kill
+# the run. The bootstrap path already runs us inside tmux, so this is skipped.
+if [[ -z "${TMUX:-}" ]]; then
+  command -v tmux >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq tmux >/dev/null; }
+  log "Re-launching inside tmux 'vps-setup' (if dropped: reconnect & 'tmux attach -t vps-setup')…"
+  exec tmux new-session -A -s vps-setup \
+    "bash '${SELF}' run '${USERNAME}'; printf '\\n[setup finished — press ENTER to close] '; read _"
+fi
 
 # Mirror all output to the terminal AND append it to a root-owned logfile via
 # sudo tee, so there's a full record of the run.
