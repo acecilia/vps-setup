@@ -274,7 +274,7 @@ cat > "${user_home}/.tmux.conf" <<'EOF'
 # ── tmux: keep long-running work alive across SSH drops ──────────────────────
 set -g default-terminal "tmux-256color"
 set -g history-limit 50000
-set -g mouse on                 # scroll & select with the mouse
+set -g mouse off                # off: let the terminal handle native copy/paste
 set -g base-index 1             # windows start at 1
 setw -g pane-base-index 1
 set -g renumber-windows on
