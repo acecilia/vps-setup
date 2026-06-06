@@ -39,6 +39,7 @@
 #     8.  SSH daemon hardening (key-only, no root login)
 #     9.  UFW firewall — public SSH kept open as a safety net
 #    10.  Lockdown — close public SSH ONLY after you confirm Tailscale works
+#    11.  Claude Code (installed for the user, as the final step)
 # ─────────────────────────────────────────────────────────────────────────────
 # Fail fast: stop on any error (-e), any unset variable (-u), or any failed
 # command in a pipe (pipefail). -E makes the ERR trap below also fire inside
@@ -469,6 +470,29 @@ EOF
 ok "Future logins auto-attach to tmux session 'main'"
 
 # ═════════════════════════════════════════════════════════════════════════════
+section "Claude Code (for ${USERNAME})"
+# ═════════════════════════════════════════════════════════════════════════════
+# Last step, installed AS the user (we're running as the user), so the binary
+# lands in ~/.local/bin and is on THIS user's PATH. Claude Code refuses to run as
+# root, so a root-time install would be both wrong and invisible here.
+CLAUDE_STATUS="not installed"
+curl -fsSL https://claude.ai/install.sh | bash || true
+if [[ -x "${user_home}/.local/bin/claude" ]]; then
+  # Make sure ~/.local/bin is on PATH for future shells (the installer usually
+  # adds it; this is belt-and-suspenders, and .bash_profile sources .bashrc).
+  if ! grep -q '.local/bin' "${user_home}/.bashrc" 2>/dev/null; then
+    printf '\n# user-local binaries (Claude Code, etc.)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "${user_home}/.bashrc"
+  fi
+  ok "Claude Code installed at ~/.local/bin/claude"
+  warn "First use: run 'claude' (as ${USERNAME}) to authenticate."
+  CLAUDE_STATUS="installed (run 'claude' to log in)"
+else
+  warn "Claude Code install didn't complete (network?). Re-run later as ${USERNAME}:"
+  warn "   curl -fsSL https://claude.ai/install.sh | bash"
+  CLAUDE_STATUS="not installed — run the installer as ${USERNAME}"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════════════════════════════════════
 echo
@@ -484,6 +508,7 @@ echo "  SSH auth .......... key-only (passwords: ${PASSWORD_AUTH}, root: ${PERMI
 echo "  fail2ban .......... ban ${F2B_BANTIME} / ${F2B_MAXRETRY} tries / ${F2B_FINDTIME}"
 echo "  Firewall .......... UFW default-deny inbound"
 echo "  cloudflared ....... ${CF_STATUS}"
+echo "  Claude Code ....... ${CLAUDE_STATUS}"
 echo "  tmux .............. auto-attaches to 'main' on login"
 echo
 if [[ "${SSH_EXPOSURE}" == "Tailscale only" ]]; then

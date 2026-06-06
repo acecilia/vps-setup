@@ -70,6 +70,23 @@ runs, edit the *Fixed policy* constants near the top of `harden-vps.sh`.
   A reload never drops existing sessions, so your root shell stays alive.
 - It's meant to run **once on a freshly provisioned box**.
 
+## Security notes
+
+A few deliberate trade-offs, called out so there are no surprises:
+
+- **Official remote installers.** Tailscale and the Cloudflare apt repo are set up
+  via their vendor scripts (`curl … | sudo sh`, signed GPG keyring). Convenient
+  and standard, but it does run vendor code as root — pin/vendor it yourself if
+  your threat model requires.
+- **Passwordless sudo** for the created user (`NOPASSWD:ALL`). The auth factor is
+  your SSH key; the account has no password. Drop `NOPASSWD` if you'd rather be
+  prompted.
+- **Cloudflare token.** Passed to `cloudflared service install` as an argument, so
+  it's briefly visible in `ps` to local users (cloudflared's own interface). It's
+  prompted with no echo and never written to the repo or logged.
+- No secrets or keys are stored in this repo — everything sensitive is prompted at
+  runtime. `*.log` is gitignored.
+
 ## After it finishes
 
 ```bash
