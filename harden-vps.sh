@@ -10,32 +10,36 @@
 # It prompts for the few things it needs — username, your SSH public key, a
 # Tailscale auth key, and a Cloudflare Tunnel token — and re-asks if you give it
 # something invalid. Everything else is fixed policy: every run produces the
-# same hardened result. There are no flags or environment variables to set.
+# same hardened result.
 #
-# Two safety properties, learned the hard way:
+# HOW IT STAYS SAFE
 #
-#   • SURVIVES SSH DROPS. The script re-launches itself inside a tmux session on
-#     the server. If your SSH connection ever drops mid-run, the work keeps going
-#     on the box — just reconnect and `tmux attach -t vps-setup` to pick it up.
-#     (Without this, a dropped connection sends SIGHUP and the run dies half-done.)
+#   • The non-root user is created FIRST, then the script re-launches the rest of
+#     itself inside a tmux session that RUNS AS and is OWNED BY that user. So if
+#     your SSH connection ever drops mid-run, the work keeps going on the box —
+#     reconnect over Tailscale as that user and `tmux attach -t vps-setup` (no
+#     sudo) to pick it right back up. Privileged steps use the user's passwordless
+#     sudo. (Running as the user also means Claude Code, ~/.tmux.conf, etc. are
+#     installed on the USER's PATH — not root's, where they'd be invisible.)
 #
-#   • NEVER CUTS YOUR ONLY WAY IN. All the safe configuration happens first; the
-#     network lockdown happens last. Public SSH is kept OPEN until you've proven,
-#     from a second terminal, that you can log in over Tailscale. Only then does
-#     the script close port 22. If you can't confirm, public SSH stays open
-#     (still key-only + fail2ban) rather than stranding you.
+#   • The network lockdown happens LAST and never cuts your only way in. Public
+#     SSH is kept open until you've confirmed, from a second terminal, that you
+#     can log in over Tailscale. Only then is port 22 closed.
 #
 # Order of operations:
-#   1.  System update + base packages
-#   2.  Non-root sudo user + your SSH key
-#   3.  fail2ban   (brute-force protection for SSH)
-#   4.  cloudflared (Cloudflare Tunnel — expose services with no open ports)
-#   5.  tmux       (persistent sessions config for the user)
-#   6.  Unattended security upgrades
-#   7.  Tailscale  (brought up and VERIFIED)
-#   8.  SSH daemon hardening (key-only, no root login)
-#   9.  UFW firewall — public SSH kept open as a safety net
-#  10.  Lockdown — close public SSH ONLY after you confirm Tailscale works
+#   Phase A (as root, before tmux):
+#     1.  Create the non-root sudo user + install your SSH key
+#   Phase B (re-launched as that user, inside its own tmux session):
+#     2.  System update + base packages
+#     3.  fail2ban
+#     4.  cloudflared (Cloudflare Tunnel)
+#     5.  tmux config
+#     6.  Claude Code (installed for the user)
+#     7.  Unattended security upgrades
+#     8.  Tailscale (brought up and VERIFIED)
+#     9.  SSH daemon hardening (key-only, no root login)
+#    10.  UFW firewall — public SSH kept open as a safety net
+#    11.  Lockdown — close public SSH ONLY after you confirm Tailscale works
 # ─────────────────────────────────────────────────────────────────────────────
 # Fail fast: stop on any error (-e), any unset variable (-u), or any failed
 # command in a pipe (pipefail). -E makes the ERR trap below also fire inside
@@ -56,60 +60,28 @@ section() { step=$((step+1)); echo; log "[${step}] $*"; }
 # exit — instead of charging ahead in a half-configured state.
 trap 'die "Failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
-# ── Preflight ────────────────────────────────────────────────────────────────
-[[ "${EUID}" -eq 0 ]] || die "Run this as root (on a fresh Hetzner box: just \`ssh root@<ip>\`)."
-command -v apt-get >/dev/null 2>&1 || die "This script targets Debian/Ubuntu (apt). Detected something else."
-[[ -t 0 ]] || die "Run this interactively — it asks for a few values (username, SSH key, Tailscale key)."
+# Absolute path to this script, so the re-exec into tmux can find it again.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
-# ── Survive SSH drops: run inside tmux ───────────────────────────────────────
-# The script runs *inside* your SSH session, so if a later step ever interrupts
-# the connection the shell would get SIGHUP and the run would die half-finished.
-# Re-exec inside a tmux session so the run keeps going on the server even if your
-# SSH connection drops — reconnect and `tmux attach -t vps-setup` to resume.
-if [[ -z "${TMUX:-}" ]]; then
-  command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq tmux >/dev/null; }
-  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-  echo ":: Re-launching inside tmux session 'vps-setup' so this survives an SSH drop."
-  echo "   If you get disconnected, reconnect and reattach. The session runs as root,"
-  echo "   so once the non-root user exists you reattach through sudo:"
-  echo "       ssh <user>@<server>            # (or root, until SSH is hardened)"
-  echo "       sudo tmux attach -t vps-setup"
-  echo
-  # -A: attach if the session already exists (e.g. resuming after a drop),
-  # otherwise create it and run the script. The trailing read keeps the pane
-  # open after the script finishes so you can read the summary if you reattach.
-  exec tmux new-session -A -s vps-setup \
-    "bash '${self}'; printf '\n[setup finished — press ENTER to close this tmux session] '; read _"
+# ── Stage detection ──────────────────────────────────────────────────────────
+# Phase A ("bootstrap") runs as root and creates the user. It then re-execs this
+# same script as  `bash harden-vps.sh run <username>`  inside the user's tmux —
+# that invocation is Phase B ("run"), and carries the username as $2.
+if [[ "${1:-}" == "run" ]]; then
+  STAGE="run"; USERNAME="${2:-}"
+else
+  STAGE="bootstrap"; USERNAME=""
 fi
 
-# Send all output (stdout + stderr) to the terminal AND append it to a logfile
-# via `tee`, so there's a full record of the run to look at afterwards.
-exec > >(tee -a "${LOG_FILE}") 2>&1
-
-echo "╭──────────────────────────────────────────────╮"
-echo "│  Hetzner VPS hardening & setup                │"
-echo "╰──────────────────────────────────────────────╯"
-echo "   log: ${LOG_FILE}   (running inside tmux session 'vps-setup')"
-
-# ── What the script asks you for ─────────────────────────────────────────────
-# These four are the only inputs. Each is prompted for when it's needed and
-# re-asked on bad input. Nothing is read from the environment — every run is the
-# same.
-USERNAME=""
-SSH_PUBLIC_KEY=""
-TAILSCALE_AUTHKEY=""
-CLOUDFLARED_TUNNEL_TOKEN=""
-
-# ── Fixed policy ─────────────────────────────────────────────────────────────
-# The hardening decisions are deliberately NOT configurable, so every run
-# produces the same locked-down box. Edit these constants if you ever need to
-# change the policy for ALL future runs.
-SSH_PORT=22            # kept at 22 — the box is reached over Tailscale, not this port
-PERMIT_ROOT_LOGIN=no   # no root SSH login
-PASSWORD_AUTH=no       # key-only SSH (no passwords)
-F2B_BANTIME=24h        # fail2ban: how long a ban lasts
-F2B_FINDTIME=10m       # fail2ban: window for counting failures
-F2B_MAXRETRY=3         # fail2ban: failures before a ban
+# ── Preflight ────────────────────────────────────────────────────────────────
+command -v apt-get >/dev/null 2>&1 || die "This script targets Debian/Ubuntu (apt). Detected something else."
+[[ -t 0 ]] || die "Run this interactively — it asks for a few values (username, SSH key, Tailscale key)."
+if [[ "${STAGE}" == "bootstrap" ]]; then
+  [[ "${EUID}" -eq 0 ]] || die "Run this as root (on a fresh Hetzner box: just \`ssh root@<ip>\`)."
+else
+  [[ -n "${USERNAME}" ]] || die "Internal error: username was not handed to the tmux stage."
+  sudo -n true 2>/dev/null || die "Passwordless sudo isn't working for '${USERNAME}' — cannot continue."
+fi
 
 is_true() { [[ "${1,,}" =~ ^(true|yes|1|y)$ ]]; }
 
@@ -127,79 +99,124 @@ ask_retry() {
   [[ "${ans,,}" =~ ^(y|yes)$ ]]
 }
 
-# Username is referenced everywhere (section titles, AllowUsers…) so resolve it
-# first. Re-asks until it's a valid Linux username.
-echo
-warn "── Non-root USERNAME ────────────────────────────────────────────────"
-warn "What:  the login name for the everyday sudo account this script creates."
-warn "Why:   you'll log in as this user; direct root SSH login is disabled."
-warn "Pick:  anything you like — lowercase letters, digits, '-' and '_'."
-while ! [[ "${USERNAME}" =~ ^[a-z_][a-z0-9_-]*$ ]]; do
-  [[ -n "${USERNAME}" ]] && warn "Invalid username '${USERNAME}' — use lowercase letters, digits, '-' and '_'."
-  ask USERNAME "Username for the non-root sudo account"
-done
+# ── Fixed policy ─────────────────────────────────────────────────────────────
+# The hardening decisions are deliberately NOT configurable, so every run
+# produces the same locked-down box. Edit these constants to change the policy
+# for ALL future runs.
+SSH_PORT=22            # kept at 22 — the box is reached over Tailscale, not this port
+PERMIT_ROOT_LOGIN=no   # no root SSH login
+PASSWORD_AUTH=no       # key-only SSH (no passwords)
+F2B_BANTIME=24h        # fail2ban: how long a ban lasts
+F2B_FINDTIME=10m       # fail2ban: window for counting failures
+F2B_MAXRETRY=3         # fail2ban: failures before a ban
 
-# Stop apt from opening interactive dialogs (e.g. "keep or replace this config
-# file?") during the upgrade — it picks the safe default instead of hanging.
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE A — as root: create the user, install the key, then hand off to tmux
+# ═════════════════════════════════════════════════════════════════════════════
+if [[ "${STAGE}" == "bootstrap" ]]; then
+  echo "╭──────────────────────────────────────────────╮"
+  echo "│  Hetzner VPS hardening & setup                │"
+  echo "╰──────────────────────────────────────────────╯"
+  echo
+  echo ":: First I'll create your non-root user, then re-launch the rest inside a"
+  echo "   tmux session OWNED BY that user. If your SSH connection drops, reconnect"
+  echo "   over Tailscale as that user and run:  tmux attach -t vps-setup"
+  echo
+
+  export DEBIAN_FRONTEND=noninteractive
+  command -v tmux >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq tmux >/dev/null; }
+
+  # Username — re-asked until it's a valid Linux username.
+  echo
+  warn "── Non-root USERNAME ────────────────────────────────────────────────"
+  warn "What:  the login name for the everyday sudo account this script creates."
+  warn "Why:   you'll log in as this user; direct root SSH login is disabled."
+  warn "Pick:  anything you like — lowercase letters, digits, '-' and '_'."
+  while ! [[ "${USERNAME}" =~ ^[a-z_][a-z0-9_-]*$ ]]; do
+    [[ -n "${USERNAME}" ]] && warn "Invalid username '${USERNAME}' — use lowercase letters, digits, '-' and '_'."
+    ask USERNAME "Username for the non-root sudo account"
+  done
+
+  # Create the user (idempotent) + passwordless sudo.
+  if id "${USERNAME}" >/dev/null 2>&1; then
+    ok "User '${USERNAME}' already exists — reusing it"
+  else
+    adduser --disabled-password --gecos "" "${USERNAME}"
+    ok "Created user '${USERNAME}'"
+  fi
+  usermod -aG sudo "${USERNAME}"
+  echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-${USERNAME}"
+  chmod 440 "/etc/sudoers.d/90-${USERNAME}"
+  visudo -cf "/etc/sudoers.d/90-${USERNAME}" >/dev/null || die "Generated sudoers file is invalid"
+  ok "Passwordless sudo enabled for '${USERNAME}'"
+
+  # SSH public key (required) — re-asked until it looks like a public key.
+  echo
+  warn "── Your SSH PUBLIC key (required) ───────────────────────────────────"
+  warn "What:  the *public* half of your SSH keypair — the one-line .pub file."
+  warn "Why:   it's installed for '${USERNAME}' so you can authenticate over SSH,"
+  warn "       both now (public IP) and later (over Tailscale)."
+  warn "Where: on your laptop run  cat ~/.ssh/id_ed25519.pub  and copy the line."
+  warn "       No keypair yet?  ssh-keygen -t ed25519  first, then copy the .pub."
+  local_key=""
+  while :; do
+    ask local_key "Paste your SSH public key (ssh-ed25519 / ssh-rsa / ecdsa-...)"
+    [[ "${local_key}" =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]] && break
+    warn "That doesn't look like a public key — it should start with ssh-ed25519 / ssh-rsa / ecdsa-. Try again."
+  done
+  user_home="/home/${USERNAME}"
+  install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "${user_home}/.ssh"
+  echo "${local_key}" > "${user_home}/.ssh/authorized_keys"
+  chmod 600 "${user_home}/.ssh/authorized_keys"
+  chown "${USERNAME}:${USERNAME}" "${user_home}/.ssh/authorized_keys"
+  ok "Installed SSH key for ${USERNAME}"
+
+  # Hand this terminal to the user so their tmux can attach to it (the pty is
+  # currently owned by root; without this, a non-root tmux can't open it).
+  tty_dev="$(tty 2>/dev/null || true)"
+  [[ -n "${tty_dev}" && -e "${tty_dev}" ]] && chown "${USERNAME}" "${tty_dev}" 2>/dev/null || true
+
+  echo
+  log "Re-launching the rest as '${USERNAME}' inside tmux session 'vps-setup'…"
+  # The session runs AS the user and is OWNED BY the user; the script inside uses
+  # the user's passwordless sudo for privileged steps. -A attaches if it already
+  # exists (resume). The trailing read keeps the pane open so you can read the
+  # summary if you reattach after it finishes.
+  exec sudo -u "${USERNAME}" -H tmux new-session -A -s vps-setup \
+    "bash '${SELF}' run '${USERNAME}'; printf '\\n[setup finished — press ENTER to close this tmux session] '; read _"
+  die "exec into tmux failed"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE B — running as ${USERNAME}, inside its own tmux session
+# ═════════════════════════════════════════════════════════════════════════════
+user_home="/home/${USERNAME}"
 export DEBIAN_FRONTEND=noninteractive
+
+# Mirror all output to the terminal AND append it to a root-owned logfile via
+# sudo tee, so there's a full record of the run.
+exec > >(sudo tee -a "${LOG_FILE}") 2>&1
+
+echo "╭──────────────────────────────────────────────╮"
+echo "│  Hetzner VPS hardening & setup                │"
+echo "╰──────────────────────────────────────────────╯"
+echo "   user: ${USERNAME}   session: tmux 'vps-setup'   log: ${LOG_FILE}"
+
+CLAUDE_STATUS="not installed"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "System update & base packages"
 # ═════════════════════════════════════════════════════════════════════════════
-apt-get update -qq
-apt-get upgrade -y -qq
-# Bare minimum: only the services the script configures. curl + CA certs are
-# assumed already present (they are on stock images); Tailscale and cloudflared
-# pull their own dependencies. (tmux is already installed by the re-exec above.)
-apt-get install -y -qq ufw fail2ban tmux unattended-upgrades >/dev/null
+sudo apt-get update -qq
+sudo apt-get upgrade -y -qq
+# Only the services the script configures. (tmux is already installed.)
+sudo apt-get install -y -qq ufw fail2ban tmux unattended-upgrades >/dev/null
 ok "Base packages installed"
-
-# ═════════════════════════════════════════════════════════════════════════════
-section "Non-root sudo user: ${USERNAME}"
-# ═════════════════════════════════════════════════════════════════════════════
-if id "${USERNAME}" >/dev/null 2>&1; then
-  ok "User '${USERNAME}' already exists — reusing it"
-else
-  adduser --disabled-password --gecos "" "${USERNAME}"
-  ok "Created user '${USERNAME}'"
-fi
-usermod -aG sudo "${USERNAME}"
-ok "Added '${USERNAME}' to sudo group"
-
-# Passwordless sudo: the account has no password (key-only SSH is the auth
-# factor), so sudo doesn't prompt for one.
-echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-${USERNAME}"
-chmod 440 "/etc/sudoers.d/90-${USERNAME}"
-visudo -cf "/etc/sudoers.d/90-${USERNAME}" >/dev/null || die "Generated sudoers file is invalid"
-ok "Passwordless sudo enabled"
-
-# Ask for the SSH public key (required). Re-asks until it looks like a public key.
-echo
-warn "── Your SSH PUBLIC key (required) ───────────────────────────────────"
-warn "What:  the *public* half of your SSH keypair — the one-line .pub file."
-warn "Why:   it's installed for '${USERNAME}' so you can authenticate over SSH."
-warn "       Tailscale restricts WHERE ssh is reachable from; this key proves WHO"
-warn "       you are. (The matching private key never leaves your laptop.)"
-warn "Where: on your laptop run  cat ~/.ssh/id_ed25519.pub  and copy the line."
-warn "       No keypair yet?  ssh-keygen -t ed25519  first, then copy the .pub."
-while :; do
-  ask SSH_PUBLIC_KEY "Paste your SSH public key (ssh-ed25519 / ssh-rsa / ecdsa-...)"
-  [[ "${SSH_PUBLIC_KEY}" =~ ^(ssh-(ed25519|rsa)|ecdsa-) ]] && break
-  warn "That doesn't look like a public key — it should start with ssh-ed25519 / ssh-rsa / ecdsa-. Try again."
-done
-
-# Install the key for the user (root keeps its existing keys, so this session stays up).
-user_home="/home/${USERNAME}"
-install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "${user_home}/.ssh"
-auth="${user_home}/.ssh/authorized_keys"
-echo "${SSH_PUBLIC_KEY}" > "${auth}"
-chmod 600 "${auth}"; chown "${USERNAME}:${USERNAME}" "${auth}"
-ok "Installed SSH key for ${USERNAME}"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "fail2ban (SSH brute-force protection)"
 # ═════════════════════════════════════════════════════════════════════════════
-cat > /etc/fail2ban/jail.local <<EOF
+sudo tee /etc/fail2ban/jail.local >/dev/null <<EOF
 # Managed by harden-vps.sh
 [DEFAULT]
 bantime  = ${F2B_BANTIME}
@@ -216,20 +233,20 @@ ignoreip = 127.0.0.1/8 ::1
 enabled = true
 port    = ${SSH_PORT}
 EOF
-systemctl enable fail2ban >/dev/null 2>&1
-systemctl restart fail2ban
+sudo systemctl enable fail2ban >/dev/null 2>&1
+sudo systemctl restart fail2ban
 ok "fail2ban active (ban ${F2B_BANTIME} after ${F2B_MAXRETRY} fails in ${F2B_FINDTIME})"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "cloudflared (Cloudflare Tunnel)"
 # ═════════════════════════════════════════════════════════════════════════════
-install -d -m 755 /usr/share/keyrings
+sudo install -d -m 755 /usr/share/keyrings
 curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-  | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+  | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
 echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
-  > /etc/apt/sources.list.d/cloudflared.list
-apt-get update -qq
-apt-get install -y -qq cloudflared >/dev/null
+  | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+sudo apt-get update -qq
+sudo apt-get install -y -qq cloudflared >/dev/null
 ok "cloudflared installed ($(cloudflared --version 2>/dev/null | head -n1))"
 
 # A connector token is required — the tunnel is how services are exposed, with
@@ -242,11 +259,12 @@ warn "       ports — the firewall stays default-deny."
 warn "Where: Cloudflare Zero Trust → Networks → Tunnels → create/pick a tunnel →"
 warn "       'Install connector' → copy the token out of the shown"
 warn "       'cloudflared service install <TOKEN>' command."
+CLOUDFLARED_TUNNEL_TOKEN=""
 while :; do
   [[ -z "${CLOUDFLARED_TUNNEL_TOKEN}" ]] && ask CLOUDFLARED_TUNNEL_TOKEN "Cloudflare Tunnel token" silent
   # `service install` decodes the token locally and registers the service.
-  if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN}" ]] && cloudflared service install "${CLOUDFLARED_TUNNEL_TOKEN}" >/dev/null 2>&1; then
-    systemctl enable --now cloudflared >/dev/null 2>&1 || true
+  if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN}" ]] && sudo cloudflared service install "${CLOUDFLARED_TUNNEL_TOKEN}" >/dev/null 2>&1; then
+    sudo systemctl enable --now cloudflared >/dev/null 2>&1 || true
     ok "cloudflared tunnel service installed and running"
     break
   fi
@@ -258,8 +276,8 @@ CF_STATUS="Tunnel service running (token-based)"
 # ═════════════════════════════════════════════════════════════════════════════
 section "tmux (persistent sessions)"
 # ═════════════════════════════════════════════════════════════════════════════
-tmux_conf="${user_home}/.tmux.conf"
-cat > "${tmux_conf}" <<'EOF'
+# Written as the user, into the user's home — no sudo/chown needed.
+cat > "${user_home}/.tmux.conf" <<'EOF'
 # ── tmux: keep long-running work alive across SSH drops ──────────────────────
 set -g default-terminal "tmux-256color"
 set -g history-limit 50000
@@ -278,43 +296,50 @@ set -g status-right-length 40
 # New named session:  tmux new -s work
 # Detach:             Ctrl-b then d
 EOF
-chown "${USERNAME}:${USERNAME}" "${tmux_conf}"
-ok "Wrote ${tmux_conf}"
+ok "Wrote ${user_home}/.tmux.conf"
 
-# Auto-create a 'main' tmux session at login so work survives disconnects.
-profile_d="${user_home}/.bash_profile"
-if ! grep -q "tmux attach -t main" "${profile_d}" 2>/dev/null; then
-  cat >> "${profile_d}" <<'EOF'
-
-# Auto-attach to a persistent tmux session on interactive SSH login
-if command -v tmux >/dev/null 2>&1 && [ -n "$PS1" ] && [ -z "$TMUX" ] && [ -n "$SSH_CONNECTION" ]; then
-  tmux attach -t main 2>/dev/null || tmux new -s main
+# ═════════════════════════════════════════════════════════════════════════════
+section "Claude Code (for ${USERNAME})"
+# ═════════════════════════════════════════════════════════════════════════════
+# Installed AS the user (we're running as the user), so the binary lands in
+# ~/.local/bin and is on THIS user's PATH. Claude Code refuses to run as root,
+# so a root-time install is both wrong and invisible here — that's the trap.
+curl -fsSL https://claude.ai/install.sh | bash || true
+if [[ -x "${user_home}/.local/bin/claude" ]]; then
+  # Make sure ~/.local/bin is on PATH for future shells (the installer usually
+  # adds it; this is belt-and-suspenders).
+  if ! grep -q '.local/bin' "${user_home}/.bashrc" 2>/dev/null; then
+    printf '\n# user-local binaries (Claude Code, etc.)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "${user_home}/.bashrc"
+  fi
+  ok "Claude Code installed at ~/.local/bin/claude"
+  warn "First use: run 'claude' (as ${USERNAME}) to authenticate."
+  CLAUDE_STATUS="installed (run 'claude' to log in)"
+else
+  warn "Claude Code install didn't complete (network?). Re-run later as ${USERNAME}:"
+  warn "   curl -fsSL https://claude.ai/install.sh | bash"
+  CLAUDE_STATUS="not installed — run the installer as ${USERNAME}"
 fi
-EOF
-  chown "${USERNAME}:${USERNAME}" "${profile_d}"
-fi
-ok "Login auto-attaches to tmux session 'main'"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Unattended security upgrades"
 # ═════════════════════════════════════════════════════════════════════════════
-cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+sudo systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 ok "Automatic security updates enabled"
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "Tailscale"
 # ═════════════════════════════════════════════════════════════════════════════
 # NOTE: bringing Tailscale up can briefly disturb networking. That's exactly why
-# the script runs inside tmux (so a blip won't kill it) and why the firewall
-# below keeps public SSH open until you've verified Tailscale works.
-curl -fsSL https://tailscale.com/install.sh | sh
+# we run inside tmux (a blip won't kill the run) and why the firewall below keeps
+# public SSH open until you've verified Tailscale works.
+curl -fsSL https://tailscale.com/install.sh | sudo sh
 ok "Tailscale installed"
-systemctl enable --now tailscaled >/dev/null 2>&1 || true
+sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
 
 echo
 warn "── TAILSCALE auth key ───────────────────────────────────────────────"
@@ -324,21 +349,21 @@ warn "       at the very end, only after you've confirmed Tailscale SSH works."
 warn "Where: https://login.tailscale.com/admin/settings/keys → 'Generate auth key'"
 warn "       (reusable or ephemeral is fine). Blank = log in via a browser URL"
 warn "       this script prints instead."
+TAILSCALE_AUTHKEY=""
 while :; do
   if [[ -z "${TAILSCALE_AUTHKEY}" ]]; then
     ask TAILSCALE_AUTHKEY "Tailscale auth key (blank for browser login)" silent
   fi
-
+  # --operator lets '${USERNAME}' run tailscale without sudo afterwards.
   if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
-    if tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh; then
+    if sudo tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh --operator="${USERNAME}"; then
       break
     fi
     warn "Tailscale rejected that auth key (expired, wrong, or already used?)."
     TAILSCALE_AUTHKEY=""
-    # loop re-asks for a fresh key
   else
     warn "Starting interactive Tailscale login — open the URL it prints and approve this machine."
-    if tailscale up --ssh; then
+    if sudo tailscale up --ssh --operator="${USERNAME}"; then
       break
     fi
     warn "Interactive Tailscale login didn't complete."
@@ -349,8 +374,8 @@ done
 # Verify Tailscale is actually connected before we trust it for the lockdown.
 TS_CONNECTED="false"
 TS_IP=""
-if tailscale status >/dev/null 2>&1; then
-  TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+if sudo tailscale status >/dev/null 2>&1; then
+  TS_IP="$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)"
   [[ -n "${TS_IP}" ]] && TS_CONNECTED="true"
 fi
 if is_true "${TS_CONNECTED}"; then
@@ -363,10 +388,10 @@ fi
 section "SSH daemon hardening"
 # ═════════════════════════════════════════════════════════════════════════════
 # Drop-in config so we never clobber the distro's sshd_config. A reload does NOT
-# drop existing sessions, so your current root shell stays alive.
+# drop existing sessions, so your current shell stays alive.
 sshd_drop="/etc/ssh/sshd_config.d/99-hardening.conf"
-install -d -m 755 /etc/ssh/sshd_config.d
-cat > "${sshd_drop}" <<EOF
+sudo install -d -m 755 /etc/ssh/sshd_config.d
+sudo tee "${sshd_drop}" >/dev/null <<EOF
 # Managed by harden-vps.sh — re-run the script to change these, not by hand.
 Port ${SSH_PORT}
 PermitRootLogin ${PERMIT_ROOT_LOGIN}
@@ -385,30 +410,30 @@ ClientAliveCountMax 2
 EOF
 ok "Wrote ${sshd_drop}"
 
-if sshd -t; then
-  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh
+if sudo sshd -t; then
+  sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || sudo systemctl restart ssh
   ok "SSH config valid and reloaded (root login: ${PERMIT_ROOT_LOGIN}, passwords: ${PASSWORD_AUTH})"
 else
-  rm -f "${sshd_drop}"
+  sudo rm -f "${sshd_drop}"
   die "sshd config test failed — reverted the drop-in so you keep your current session."
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 section "UFW firewall"
 # ═════════════════════════════════════════════════════════════════════════════
-ufw --force reset >/dev/null
-ufw default deny incoming  >/dev/null
-ufw default allow outgoing >/dev/null
+sudo ufw --force reset >/dev/null
+sudo ufw default deny incoming  >/dev/null
+sudo ufw default allow outgoing >/dev/null
 
 # Allow everything over the Tailscale interface — your trusted path in.
-ufw allow in on tailscale0 comment 'Tailscale mesh' >/dev/null
+sudo ufw allow in on tailscale0 comment 'Tailscale mesh' >/dev/null
 
 # IMPORTANT: keep public SSH OPEN for now. The lockdown step below closes it only
 # after you've confirmed a working Tailscale login, so a dropped connection can
 # never strand you. UFW permits already-established connections, so enabling it
 # here does not cut your current session either.
-ufw allow "${SSH_PORT}/tcp" comment 'SSH (public — closed after Tailscale verified)' >/dev/null
-ufw --force enable >/dev/null
+sudo ufw allow "${SSH_PORT}/tcp" comment 'SSH (public — closed after Tailscale verified)' >/dev/null
+sudo ufw --force enable >/dev/null
 ok "UFW enabled — default-deny inbound; SSH reachable via Tailscale AND public ${SSH_PORT} for now"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -434,27 +459,22 @@ if is_true "${TS_CONNECTED}"; then
     case "${GATE,,}" in
       lock|locked|y|yes)
         echo
-        warn "About to CLOSE public port ${SSH_PORT}. Here's what happens next:"
-        echo "     • If THIS terminal is connected over the public IP, it may freeze or"
-        echo "       disconnect the moment the port closes."
-        echo "     • That's fine — the setup is running inside tmux ON THE SERVER, so it"
-        echo "       does NOT die. It finishes regardless, and the result is in the log:"
-        echo "         ${LOG_FILE}"
-        echo "     • To get back to this session, reconnect over Tailscale and reattach."
-        echo "       It runs as root, but you log in as '${USERNAME}' (root SSH is off),"
-        echo "       so reattach through sudo:"
+        warn "About to CLOSE public port ${SSH_PORT}. What happens next:"
+        echo "     • If THIS terminal is connected over the public IP, it may freeze"
+        echo "       or disconnect the moment the port closes."
+        echo "     • That's fine — this session runs in tmux ON THE SERVER as you, so"
+        echo "       it does NOT die. It finishes, and the result is in ${LOG_FILE}."
+        echo "     • To get back to it, reconnect over Tailscale and reattach — no sudo,"
+        echo "       it's your own session:"
         echo
         echo "            ssh ${USERNAME}@${TS_IP}"
-        echo "            sudo tmux attach -t vps-setup"
+        echo "            tmux attach -t vps-setup"
         echo
-        echo "       (If login drops you into your own 'main' tmux first, press Ctrl-b"
-        echo "        then d to detach, then run the sudo line above.)"
-        echo "       (If you're ALREADY connected over Tailscale, nothing drops — you'll"
-        echo "        just fall through to the summary below.)"
+        echo "       (Already on Tailscale? Nothing drops — you'll just see the summary.)"
         echo
         read -rp "   Press ENTER to close public SSH now (or Ctrl-C to abort and keep it open)... " _
-        ufw delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
-        ufw reload >/dev/null 2>&1 || true
+        sudo ufw delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+        sudo ufw reload >/dev/null 2>&1 || true
         ok "Public port ${SSH_PORT} closed — SSH is now reachable ONLY over Tailscale."
         SSH_EXPOSURE="Tailscale only"
         break ;;
@@ -469,10 +489,29 @@ if is_true "${TS_CONNECTED}"; then
   done
 else
   warn "Tailscale was not confirmed — leaving public SSH OPEN so you aren't locked out."
-  warn "Once Tailscale works (tailscale up --ssh) and you've verified  ssh ${USERNAME}@<tailscale-ip> ,"
+  warn "Once Tailscale works (sudo tailscale up --ssh) and you've verified  ssh ${USERNAME}@<tailscale-ip> ,"
   warn "close public SSH with:  sudo ufw delete allow ${SSH_PORT}/tcp"
   SSH_EXPOSURE="Public (key-only + fail2ban)"
 fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Persistent-session login hook (written LAST, so reconnects during setup land in
+# a plain shell where `tmux attach -t vps-setup` works without interference).
+# ═════════════════════════════════════════════════════════════════════════════
+profile="${user_home}/.bash_profile"
+if ! grep -q "tmux attach -t main" "${profile}" 2>/dev/null; then
+  cat >> "${profile}" <<'EOF'
+
+# Load .bashrc (PATH like ~/.local/bin, aliases) for login shells too
+if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+
+# Auto-attach to a persistent tmux session on interactive SSH login
+if command -v tmux >/dev/null 2>&1 && [ -n "$PS1" ] && [ -z "$TMUX" ] && [ -n "$SSH_CONNECTION" ]; then
+  tmux attach -t main 2>/dev/null || tmux new -s main
+fi
+EOF
+fi
+ok "Future logins auto-attach to tmux session 'main'"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary
@@ -490,6 +529,7 @@ echo "  SSH auth .......... key-only (passwords: ${PASSWORD_AUTH}, root: ${PERMI
 echo "  fail2ban .......... ban ${F2B_BANTIME} / ${F2B_MAXRETRY} tries / ${F2B_FINDTIME}"
 echo "  Firewall .......... UFW default-deny inbound"
 echo "  cloudflared ....... ${CF_STATUS}"
+echo "  Claude Code ....... ${CLAUDE_STATUS}"
 echo "  tmux .............. auto-attaches to 'main' on login"
 echo
 if [[ "${SSH_EXPOSURE}" == "Tailscale only" ]]; then
