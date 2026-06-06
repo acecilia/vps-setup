@@ -421,7 +421,7 @@ if is_true "${TS_CONNECTED}"; then
     case "${GATE,,}" in
       lock|locked|y|yes)
         echo
-        warn "About to CLOSE public port ${SSH_PORT}. What happens next:"
+        warn "Closing public port ${SSH_PORT} now. What happens next:"
         echo "     • If THIS terminal is connected over the public IP, it may freeze"
         echo "       or disconnect the moment the port closes."
         echo "     • That's fine — this session runs in tmux ON THE SERVER as you, so"
@@ -434,7 +434,6 @@ if is_true "${TS_CONNECTED}"; then
         echo
         echo "       (Already on Tailscale? Nothing drops — you'll just see the summary.)"
         echo
-        read -rp "   Press ENTER to close public SSH now (or Ctrl-C to abort and keep it open)... " _
         sudo ufw delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
         sudo ufw reload >/dev/null 2>&1 || true
         ok "Public port ${SSH_PORT} closed — SSH is now reachable ONLY over Tailscale."
